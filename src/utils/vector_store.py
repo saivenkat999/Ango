@@ -1,444 +1,584 @@
 import os
 import json
 import hashlib
-import chromadb
-import numpy as np  # Add numpy import
-from chromadb.config import Settings
-from chromadb.api.models.Collection import Collection
-from typing import List, Dict, Any, Optional, Union, Tuple
-from agno.embedder.openai import OpenAIEmbedder
-from chromadb.errors import InvalidCollectionException
-from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+from functools import lru_cache
+from typing import List, Dict, Any, Optional, Union, Iterable, Tuple
 import logging
-import traceback
+import lancedb
+import numpy as np
+import pyarrow as pa
+from src.utils.config import Config
+import pandas as pd
+from lancedb.pydantic import LanceModel, Vector
+from lancedb.rerankers import LinearCombinationReranker
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("VectorStore")
 
-class CachedEmbeddingFunction:
-    """A wrapper that adds caching to any embedding function"""
-    
-    def __init__(self, embedding_function, cache_dir: str = "./.cache/embeddings"):
-        """
-        Initialize the cached embedding function.
-        
-        Args:
-            embedding_function: The embedding function to wrap
-            cache_dir: Directory to store cached embeddings
-        """
-        self.embedding_function = embedding_function
-        self.cache_dir = cache_dir
-        self.cache_hits = 0
-        self.cache_misses = 0
-        
-        # Create cache directory if it doesn't exist
-        os.makedirs(cache_dir, exist_ok=True)
-        
-        # Load existing cache index if it exists
-        self.cache_index_path = os.path.join(cache_dir, "cache_index.json")
-        if os.path.exists(self.cache_index_path):
-            try:
-                with open(self.cache_index_path, 'r') as f:
-                    self.cache_index = json.load(f)
-            except Exception as e:
-                logger.warning(f"Failed to load cache index: {str(e)}. Creating new index.")
-                self.cache_index = {}
-        else:
-            self.cache_index = {}
-    
-    def __call__(self, input: List[str]) -> List[List[float]]:
-        """
-        Generate embeddings for text with caching.
-        
-        Args:
-            input: List of text strings to embed
-            
-        Returns:
-            List of embedding vectors
-        """
-        results = []
-        texts_to_embed = []
-        original_indices = []
-        
-        # Check cache for each input text
-        for i, text in enumerate(input):
-            # Create a hash of the text for cache key
-            text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
-            
-            # Check if in cache
-            if text_hash in self.cache_index:
-                cache_file = os.path.join(self.cache_dir, f"{text_hash}.json")
-                try:
-                    with open(cache_file, 'r') as f:
-                        cached_embedding = json.load(f)
-                        results.append(cached_embedding)
-                        self.cache_hits += 1
-                        continue
-                except Exception as e:
-                    logger.warning(f"Failed to load cached embedding: {str(e)}")
-                    # Fall back to computing embedding
-            
-            # If not in cache, add to list to compute
-            texts_to_embed.append(text)
-            original_indices.append(i)
-            self.cache_misses += 1
-        
-        # If there are texts to embed, compute them
-        if texts_to_embed:
-            new_embeddings = self.embedding_function(texts_to_embed)
-            
-            # Store new embeddings in cache
-            for j, embedding in enumerate(new_embeddings):
-                text = texts_to_embed[j]
-                text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
-                
-                # Convert NumPy arrays to Python lists for JSON serialization
-                if isinstance(embedding, np.ndarray):
-                    embedding = embedding.tolist()
-                
-                # Save to cache file
-                cache_file = os.path.join(self.cache_dir, f"{text_hash}.json")
-                with open(cache_file, 'w') as f:
-                    json.dump(embedding, f)
-                
-                # Update cache index
-                self.cache_index[text_hash] = True
-                
-                # Save updated index periodically
-                if (self.cache_hits + self.cache_misses) % 100 == 0:
-                    self._save_cache_index()
-        
-        # Merge cached and new embeddings
-        final_results = [None] * len(input)
-        
-        # Place cached results
-        for i, emb in enumerate(results):
-            final_results[i] = emb
-        
-        # Place new results
-        if texts_to_embed:
-            for j, emb in enumerate(new_embeddings):
-                # Convert NumPy arrays to Python lists for JSON serialization
-                if isinstance(emb, np.ndarray):
-                    emb = emb.tolist()
-                idx = original_indices[j]
-                final_results[idx] = emb
-        
-        # Log cache stats periodically
-        if (self.cache_hits + self.cache_misses) % 100 == 0:
-            hit_rate = self.cache_hits / (self.cache_hits + self.cache_misses) * 100 if (self.cache_hits + self.cache_misses) > 0 else 0
-            logger.info(f"Embedding cache stats: {self.cache_hits} hits, {self.cache_misses} misses ({hit_rate:.1f}% hit rate)")
-        
-        return final_results
-    
-    def _save_cache_index(self):
-        """Save the cache index to disk."""
-        try:
-            with open(self.cache_index_path, 'w') as f:
-                json.dump(self.cache_index, f)
-        except Exception as e:
-            logger.warning(f"Failed to save cache index: {str(e)}")
-
-class AgnoEmbeddingFunction:
-    """Wrapper to make Agno's embedders compatible with ChromaDB's embedding function interface."""
-    
-    def __init__(self, embedder=None, id="text-embedding-3-small"):
-        """
-        Initialize the embedding function with an Agno embedder.
-        
-        Args:
-            embedder: An existing Agno embedder instance, or None to create a new one
-            id: The model ID to use if creating a new embedder
-        """
-        if embedder:
-            self.embedder = embedder
-        else:
-            # Initialize with proper model ID
-            logger.info(f"Initializing new OpenAIEmbedder with model ID: {id}")
-            self.embedder = OpenAIEmbedder(id=id)
-            # Verify that we have access to the embedder methods
-            if hasattr(self.embedder, 'get_embedding'):
-                logger.info(f"OpenAIEmbedder has get_embedding method: {self.embedder.get_embedding}")
-            else:
-                logger.warning(f"OpenAIEmbedder DOES NOT have get_embedding method")
-            logger.info(f"OpenAIEmbedder initialized successfully: {type(self.embedder).__name__}")
-    
-    def __call__(self, input: List[str]) -> List[List[float]]:
-        """
-        Generate embeddings for a list of text documents.
-        
-        Args:
-            input: List of text strings to embed
-            
-        Returns:
-            List of embedding vectors
-        """
-        # Log details about what we're trying to embed
-        logger.info(f"Generating embeddings for {len(input)} text items")
-        
-        # Process each text individually using get_embedding
-        embeddings = []
-        for i, text in enumerate(input):
-            try:
-                logger.debug(f"Embedding text item {i+1}/{len(input)} (length: {len(text)})")
-                # Following Agno's pattern of using get_embedding for both single and multiple texts
-                embedding = self.embedder.get_embedding(text)
-                
-                # Convert numpy arrays to lists if needed
-                if isinstance(embedding, np.ndarray):
-                    embedding = embedding.tolist()
-                
-                # Log embedding dimensionality
-                if i == 0:  # Only log this for the first item to avoid flooding logs
-                    logger.info(f"Successfully generated embedding with dim: {len(embedding)}")
-                
-                embeddings.append(embedding)
-            except Exception as e:
-                error_msg = f"Failed to generate embedding for text item {i+1}: {str(e)}"
-                logger.error(error_msg)
-                logger.error(f"Exception type: {type(e).__name__}")
-                logger.error(f"Exception traceback: {traceback.format_exc()}")
-                logger.error(f"Text length: {len(text)}")
-                logger.error(f"Embedder type: {type(self.embedder).__name__}")
-                logger.error(f"Full exception details: {str(e)}")
-                raise ValueError(error_msg)
-        
-        logger.info(f"Successfully generated embeddings for all {len(input)} text items")
-        return embeddings
-
 class VectorStore:
-    """Utility class for managing the ChromaDB vector store."""
-    
-    def __init__(self, 
-                 persistence_directory: str = "./data/vector_store",
-                 collection_name: str = "document_store",
-                 embedding_function: Optional[Any] = None,
-                 enable_caching: bool = True,
-                 cache_dir: str = "./.cache/embeddings",
-                 batch_size: int = 100):
+    """Utility class for managing the LanceDB vector store with hybrid search capabilities."""
+
+    def __init__(self,
+                 persistence_directory: str = None,
+                 collection_name: str = None,
+                 embedding_model_id: str = None,
+                 search_type: str = None,
+                 batch_size: int = None):
         """
-        Initialize the vector store with ChromaDB.
+        Initialize the vector store with LanceDB.
+
+        Args:
+            persistence_directory: Directory to persist LanceDB data (defaults to Config.PERSISTENCE_DIRECTORY)
+            collection_name: Name of the LanceDB table (defaults to Config.COLLECTION_NAME)
+            embedding_model_id: ID of the embedding model to use (defaults to Config.EMBEDDING_MODEL_ID)
+            search_type: Type of search to use (defaults to Config.SEARCH_TYPE)
+            batch_size: Batch size for adding documents (defaults to Config.BATCH_SIZE)
+        """
+        # Use provided values or defaults from Config
+        self.persistence_directory = persistence_directory or Config.PERSISTENCE_DIRECTORY
+        self.collection_name = collection_name or Config.COLLECTION_NAME
+        self.embedding_model_id = embedding_model_id or Config.EMBEDDING_MODEL_ID
+        self.search_type = search_type or Config.SEARCH_TYPE
+        self.batch_size = batch_size or Config.BATCH_SIZE
+        
+        # Ensure the persistence directory exists
+        os.makedirs(self.persistence_directory, exist_ok=True)
+
+        # Initialize FastEmbed model
+        logger.info(f"Initializing FastEmbedder with model ID: {self.embedding_model_id}")
+        try:
+            from fastembed import TextEmbedding
+            
+            # Check if the model ID is valid
+            available_models = TextEmbedding.list_supported_models()
+            model_ids = [model.get('model', '').lower() for model in available_models]
+            
+            # Log available models for debugging
+            logger.debug(f"Available embedding models: {model_ids}")
+            
+            # Check if the specified model is available
+            if self.embedding_model_id.lower() not in [m.lower() for m in model_ids]:
+                logger.warning(f"Model ID '{self.embedding_model_id}' not found in supported models. Using default model.")
+                # Use a default model if the specified one is not available
+                self.embedder = TextEmbedding()
+                self.embedding_model_id = "BAAI/bge-small-en"  # Default model
+            else:
+                self.embedder = TextEmbedding(model_name=self.embedding_model_id)
+            
+            # Get dimensions by embedding a test string
+            test_embedding = next(self.embedder.embed("test"))
+            self.embedding_dim = len(test_embedding)
+            logger.info(f"Embedding dimension: {self.embedding_dim}")
+            
+            # Initialize the reranker for hybrid search
+            self.reranker = LinearCombinationReranker(weight=0.7)
+            logger.info("Initialized LinearCombinationReranker for hybrid search")
+            
+            # Initialize cache for embeddings
+            self._embedding_cache = {}
+            
+        except ImportError:
+            logger.error("fastembed not installed. Please install with 'pip install fastembed'")
+            raise
+        except Exception as e:
+            logger.error(f"Error initializing embedding model: {str(e)}")
+            raise
+
+        # Initialize LanceDB connection
+        self.db = lancedb.connect(self.persistence_directory)
+
+        # Check if table exists and drop if necessary for testing purposes
+        if self.collection_name in self.db.table_names():
+            logger.info(f"Using existing table: {self.collection_name}")
+            self.table = self.db.open_table(self.collection_name)
+            
+            # Check if vector index exists, create if it doesn't
+            try:
+                indices = list(self.table.list_indices())
+                has_vector_index = any(idx.column == "vector" for idx in indices)
+                if not has_vector_index:
+                    logger.info("Creating missing vector index")
+                    self.table.create_index(
+                        column="vector",
+                        index_type="IVF_PQ",
+                        metric="L2"
+                    )
+            except Exception as e:
+                logger.warning(f"Error checking indices: {str(e)}")
+                
+            # Create FTS index if needed and doesn't exist
+            if self.search_type in ["hybrid", "text"]:
+                try:
+                    has_fts_index = any(idx.column == "text" and idx.index_type == "FTS" for idx in indices)
+                    if not has_fts_index:
+                        logger.info("Creating missing FTS index")
+                        self.table.create_fts_index("text", replace=True)
+                except Exception as e:
+                    logger.warning(f"Error checking FTS index: {str(e)}")
+        else:
+            logger.info(f"Creating new table: {self.collection_name}")
+            self._create_table()
+
+        logger.info(f"Created LanceDB table: {self.collection_name} with correct schema")
+
+    def _create_table(self):
+        """Create the LanceDB table with the proper schema."""
+        # Define the schema using PyArrow
+        schema = pa.schema([
+            pa.field("vector", lancedb.vector(self.embedding_dim)),  # Vector type for embeddings
+            pa.field("id", pa.string()),  # String type for ID
+            pa.field("text", pa.string()),  # String type for text
+            pa.field("metadata", pa.string())  # Store metadata as serialized JSON
+        ])
+
+        # Create the table with the schema
+        self.table = self.db.create_table(
+            name=self.collection_name,
+            schema=schema,
+            mode="overwrite"
+        )
+
+        # Create full-text search index if needed for hybrid or text search
+        if self.search_type in ["hybrid", "text"]:
+            self.table.create_fts_index("text", replace=True)
+        
+        # Create vector index for vector search
+        self.table.create_index(
+            column="vector",
+            index_type="IVF_PQ",
+            metric="L2",
+            replace=True
+        )
+
+    @lru_cache(maxsize=100)
+    def _get_embedding_cached(self, text_hash: str) -> np.ndarray:
+        """
+        Get cached embedding for text hash or generate if not in cache.
         
         Args:
-            persistence_directory: Directory to persist ChromaDB data
-            collection_name: Name of the ChromaDB collection
-            embedding_function: Optional custom embedding function
-            enable_caching: Whether to enable embedding caching
-            cache_dir: Directory to store cached embeddings
-            batch_size: Batch size for adding documents
+            text_hash: Hash of the text to get embedding for
+            
+        Returns:
+            The embedding vector
         """
-        # Ensure the persistence directory exists
-        os.makedirs(persistence_directory, exist_ok=True)
+        if text_hash in self._embedding_cache:
+            return self._embedding_cache[text_hash]
+        return None
         
-        # Store batch size
-        self.batch_size = batch_size
+    def _embed_text(self, text: str) -> np.ndarray:
+        """Generate embedding for text using the configured embedder."""
+        # Create a hash of the text to use as cache key
+        text_hash = hashlib.md5(text.encode()).hexdigest()
         
-        # Initialize ChromaDB client with persistence
-        self.client = chromadb.PersistentClient(
-            path=persistence_directory,
-            settings=Settings(
-                anonymized_telemetry=False,  # Disable telemetry
-                allow_reset=True,  # Allow collection reset if needed
-            )
-        )
-        
-        # Create or get the embedding function
-        if embedding_function is None:
-            # Use ChromaDB's built-in OpenAI embedding function
-            # This will automatically get the API key from the environment variable OPENAI_API_KEY
-            openai_api_key = os.environ.get("OPENAI_API_KEY")
-            raw_embedding_function = OpenAIEmbeddingFunction(
-                api_key=openai_api_key,
-                model_name="text-embedding-3-small"
-            )
-        else:
-            raw_embedding_function = embedding_function
+        # Check if we have a cached embedding
+        cached_embedding = self._get_embedding_cached(text_hash)
+        if cached_embedding is not None:
+            return cached_embedding
             
-        # Apply caching if enabled
-        if enable_caching:
-            self.embedding_function = CachedEmbeddingFunction(
-                raw_embedding_function,
-                cache_dir=cache_dir
-            )
-        else:
-            self.embedding_function = raw_embedding_function
-            
-        # Initialize collection
-        self.collection = self._get_or_create_collection(collection_name)
-        
-        # Initialize query cache
-        self._query_cache = {}
-        self._max_query_cache_size = 100
-    
-    def _get_or_create_collection(self, collection_name: str) -> Collection:
-        """Get or create a ChromaDB collection."""
         try:
-            return self.client.get_collection(
-                name=collection_name,
-                embedding_function=self.embedding_function
-            )
-        except InvalidCollectionException:
-            return self.client.create_collection(
-                name=collection_name,
-                embedding_function=self.embedding_function
-            )
-    
+            # The embedder.embed() returns an iterator of numpy arrays
+            # We take the first (and only) embedding
+            embedding = next(self.embedder.embed(text))
+            
+            # Cache the embedding
+            self._embedding_cache[text_hash] = embedding
+            
+            return embedding
+        except Exception as e:
+            logger.error(f"Error generating embedding: {str(e)}")
+            # Return zeros array if embedding fails
+            return np.zeros(self.embedding_dim)
+
     def add_documents(self, documents: List[Dict[str, Any]]) -> None:
         """
         Add documents to the vector store.
-        
+
         Args:
-            documents: List of document dictionaries with 'id', 'text', and 'metadata'
+            documents: List of document dictionaries with text and metadata
         """
         if not documents:
-            logger.warning("No documents to add to vector store")
+            logger.warning("No documents to add")
             return
-            
-        logger.info(f"Adding {len(documents)} documents to vector store")
-        
-        # Extract IDs, texts, and metadata from documents
-        ids = [doc["id"] for doc in documents]
-        texts = [doc["text"] for doc in documents]
-        metadatas = [doc["metadata"] for doc in documents]
-        
-        # Add to collection in batches to avoid memory issues
-        added_count = 0
-        for i in range(0, len(ids), self.batch_size):
-            batch_ids = ids[i:i+self.batch_size]
-            batch_texts = texts[i:i+self.batch_size]
-            batch_metadatas = metadatas[i:i+self.batch_size]
-            
-            # Log progress
-            batch_end = min(i + self.batch_size, len(ids))
-            logger.info(f"Adding batch {i+1}-{batch_end} of {len(ids)}")
-            
-            # Add the batch to the collection
-            try:
-                self.collection.add(
-                    ids=batch_ids,
-                    documents=batch_texts,
-                    metadatas=batch_metadatas
-                )
-                added_count += len(batch_ids)
-            except Exception as e:
-                logger.error(f"Error adding batch to vector store: {str(e)}")
-        
-        logger.info(f"Successfully added {added_count} documents to vector store")
-        
-        # Clear query cache after adding new documents
-        self._query_cache = {}
-    
-    def query(self, 
-              query_text: str, 
-              n_results: int = 5, 
-              metadata_filter: Optional[Dict] = None,
-              use_cache: bool = True,
-              min_relevance_score: float = 0.75) -> Dict:
-        """
-        Query the vector store for documents similar to the query text.
-        
-        Args:
-            query_text: Text to query
-            n_results: Maximum number of results to return
-            metadata_filter: Optional filter to apply to metadata
-            use_cache: Whether to use the query cache
-            min_relevance_score: Minimum relevance score (1.0 - distance) for results
-            
-        Returns:
-            Dictionary containing query results
-        """
-        # Generate cache key
-        if use_cache:
-            # Convert metadata_filter to a JSON string if it exists
-            metadata_filter_str = json.dumps(metadata_filter) if metadata_filter else 'None'
-            cache_key = f"{query_text}_{n_results}_{min_relevance_score}_{metadata_filter_str}"
-            
-            # Check cache
-            if cache_key in self._query_cache:
-                logger.info(f"Using cached results for query: {query_text[:30]}...")
-                return self._query_cache[cache_key]
-        
-        # Build the query
-        try:
-            # Request more results than needed to account for filtering
-            actual_n_results = min(n_results * 3, 20)  # Get more results for filtering but cap at 20
-            
-            # Execute query with proper error handling
-            try:
-                if metadata_filter:
-                    results = self.collection.query(
-                        query_texts=[query_text],
-                        n_results=actual_n_results,
-                        where=metadata_filter
-                    )
-                else:
-                    results = self.collection.query(
-                        query_texts=[query_text],
-                        n_results=actual_n_results
-                    )
-            except ValueError as ve:
-                if "embeddings" in str(ve).lower():
-                    logger.error(f"Embedding error during query: {str(ve)}")
-                    return {
-                        "ids": [[]],
-                        "documents": [[]],
-                        "metadatas": [[]],
-                        "distances": [[]]
-                    }
-                else:
-                    # Re-raise other ValueError exceptions
-                    raise
-            
-            # Cache results if enabled
-            if use_cache:
-                # Make sure the results are JSON serializable
-                serializable_results = self._make_serializable(results)
-                
-                # Limit cache size with LRU policy
-                if len(self._query_cache) >= self._max_query_cache_size:
-                    # Remove oldest item (first key)
-                    oldest_key = next(iter(self._query_cache))
-                    del self._query_cache[oldest_key]
-                
-                # Add to cache
-                self._query_cache[cache_key] = serializable_results
-                
-                return serializable_results
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Error querying vector store: {str(e)}")
-            # Return empty results on error
-            return {
-                "ids": [[]],
-                "documents": [[]],
-                "metadatas": [[]],
-                "distances": [[]]
+
+        # Convert documents to LanceDB format
+        lance_docs = []
+
+        for doc in documents:
+            # Skip documents without text
+            if not doc.get('text'):
+                logger.warning(f"Skipping document without text: {doc.get('id', 'NO_ID')}")
+                continue
+
+            # Generate document ID if not provided
+            doc_id = str(doc.get('id', '')) or str(hash(doc['text']))
+
+            # Generate embedding
+            embedding = self._embed_text(doc['text'])
+
+            # Create LanceDB document with serialized metadata
+            lance_doc = {
+                "id": doc_id,
+                "vector": embedding,
+                "text": doc['text'],
+                "metadata": json.dumps(doc.get('metadata', {}))  # Serialize metadata to JSON
             }
-    
-    def _make_serializable(self, results: Dict) -> Dict:
+
+            lance_docs.append(lance_doc)
+
+        # Process documents in batches for better performance
+        for i in range(0, len(lance_docs), self.batch_size):
+            batch = lance_docs[i:i + self.batch_size]
+            if batch:
+                try:
+                    # Add documents to LanceDB
+                    self.table.add(batch)
+                    logger.info(f"Added batch of {len(batch)} documents")
+                except Exception as e:
+                    logger.error(f"Error adding documents: {str(e)}")
+                    raise
+
+    def query(self,
+             query_text: str,
+             n_results: int = None,
+             metadata_filter: Optional[Dict[str, Any]] = None,
+             search_type: str = None) -> List[Dict[str, Any]]:
         """
-        Convert query results to a JSON serializable format.
-        
+        Query the vector store for relevant documents.
+
         Args:
-            results: Query results from ChromaDB
-            
+            query_text: The query text to search for
+            n_results: Number of results to return (defaults to Config.MAX_RESULTS)
+            metadata_filter: Optional filter for metadata fields
+            search_type: Type of search to use (defaults to self.search_type)
+
         Returns:
-            JSON serializable results dictionary
+            List of dictionaries containing document info and relevance scores
         """
-        serializable_results = {}
+        # Validate inputs
+        if not query_text or not isinstance(query_text, str):
+            logger.error(f"Invalid query_text provided: {query_text}")
+            return []
+            
+        # Normalize query text
+        query_text = query_text.strip()
+        if not query_text:
+            logger.error("Empty query text after normalization")
+            return []
+            
+        # Use Config.MAX_RESULTS if n_results not provided
+        n_results = n_results or Config.MAX_RESULTS
+        search_type = search_type or self.search_type or Config.SEARCH_TYPE
         
-        # Copy the structure but ensure all elements are serializable
-        for key, value in results.items():
-            if key == "distances" and value:
-                # Convert numpy arrays to lists if needed
-                if isinstance(value[0], np.ndarray):
-                    serializable_results[key] = [arr.tolist() for arr in value]
+        start_time = pd.Timestamp.now()
+        logger.debug(f"Starting query: {query_text}, search_type={search_type}, n_results={n_results}")
+        
+        try:
+            # Ensure a connection to the database
+            if not hasattr(self, 'db') or not hasattr(self, 'table'):
+                logger.warning("Database connection not initialized, reconnecting...")
+                self.db = lancedb.connect(self.persistence_directory)
+                if self.collection_name in self.db.table_names():
+                    self.table = self.db.open_table(self.collection_name)
                 else:
-                    serializable_results[key] = value
-            else:
-                serializable_results[key] = value
-        
-        return serializable_results 
+                    logger.error(f"Table {self.collection_name} does not exist")
+                    return []
+            
+            # Generate embedding for the query text
+            query_embedding = self._embed_text(query_text)
+            if query_embedding is None or np.all(query_embedding == 0):
+                logger.error("Failed to generate embedding for query")
+                return []
+            
+            # Initialize search based on search type
+            if search_type == "hybrid":
+                # For hybrid search, we need to manually generate the embedding
+                query_embedding = self._embed_text(query_text)
+                logger.debug(f"Using hybrid search with query: {query_text}")
+                try:
+                    # First, try using the built-in hybrid search
+                    hybrid_search = self.table.search(
+                        query=query_text,
+                        vector_column_name="vector",
+                        query_type="hybrid",
+                        fts_columns=["text"]
+                    )
+                    # Apply the reranker with the correct method signature
+                    search_query = hybrid_search.rerank(self.reranker)
+                    results = search_query.limit(n_results * 3).to_pandas()  # Get more results for filtering
+                    logger.debug(f"Built-in hybrid search found {len(results)} results before metadata filtering")
+                except Exception as e:
+                    logger.warning(f"Built-in hybrid search failed: {str(e)}. Using enhanced manual hybrid search.")
+                    
+                    # Enhanced manual hybrid approach - perform both searches and combine results
+                    try:
+                        # Perform vector search
+                        vector_results = self.table.search(
+                            query=query_embedding,
+                            vector_column_name="vector",
+                            query_type="vector"
+                        ).limit(n_results * 3).to_pandas()  # Get more results for filtering
+                        logger.debug(f"Vector search found {len(vector_results)} results")
+                        
+                        # Perform text search
+                        text_results = self.table.search(
+                            query=query_text,
+                            query_type="fts",
+                            fts_columns=["text"]
+                        ).limit(n_results * 3).to_pandas()  # Get more results for filtering
+                        logger.debug(f"Text search found {len(text_results)} results")
+                        
+                        # Combine results from both searches
+                        if not vector_results.empty and not text_results.empty:
+                            # Assign scores - normalize and combine for better ranking
+                            # For vector results, higher score is better (closer to 1.0)
+                            if '_distance' in vector_results.columns:
+                                # Convert distance to similarity score (1.0 - distance)
+                                # Add a small epsilon to avoid division by zero
+                                epsilon = 1e-10
+                                max_distance = vector_results['_distance'].max() + epsilon
+                                # Normalize distances to [0, 1] range and convert to similarity
+                                vector_results['_score'] = 1.0 - (vector_results['_distance'] / max_distance)
+                            
+                            # Normalize text search scores if they exist
+                            if '_score' in text_results.columns:
+                                max_score = text_results['_score'].max()
+                                if max_score > 0:
+                                    text_results['_score'] = text_results['_score'] / max_score
+                            else:
+                                # If no score column exists, add a default score
+                                text_results['_score'] = 0.5
+                            
+                            # Combine with preference to documents found in both searches
+                            all_results = pd.concat([vector_results, text_results])
+                            # Count occurrences of each id to prioritize results found by both methods
+                            id_counts = all_results['id'].value_counts().to_dict()
+                            all_results['found_in_both'] = all_results['id'].map(id_counts)
+                            
+                            # Calculate combined score - prioritize items found in both searches
+                            # and give higher weight to vector search (0.7) than text search (0.3)
+                            def calculate_combined_score(row):
+                                base_score = row.get('_score', 0.5)
+                                boost = 1.0 if row['found_in_both'] > 1 else 0.0
+                                return base_score + (boost * 0.2)  # Add 0.2 boost for items found in both
+                            
+                            all_results['combined_score'] = all_results.apply(calculate_combined_score, axis=1)
+                            
+                            # Sort by combined score, descending
+                            all_results = all_results.sort_values(by='combined_score', ascending=False)
+                            
+                            # Remove duplicates, keeping the first occurrence (highest score)
+                            results = all_results.drop_duplicates(subset=['id'])
+                            logger.debug(f"Combined search found {len(results)} unique results")
+                        elif not vector_results.empty:
+                            results = vector_results
+                            logger.debug(f"Using only vector search results: {len(results)}")
+                        elif not text_results.empty:
+                            results = text_results
+                            logger.debug(f"Using only text search results: {len(results)}")
+                        else:
+                            logger.warning("Both vector and text search returned empty results")
+                            results = pd.DataFrame()
+                    except Exception as e2:
+                        logger.warning(f"Enhanced manual hybrid search failed: {str(e2)}. Falling back to simple vector search.")
+                        # Fall back to simple vector search
+                        search_query = self.table.search(
+                            query=query_embedding,
+                            vector_column_name="vector",
+                            query_type="vector"
+                        )
+                        results = search_query.limit(n_results * 3).to_pandas()  # Get more results for filtering
+                        logger.debug(f"Fallback vector search found {len(results)} results")
+            elif search_type == "vector":
+                # For vector search, we manually generate the embedding
+                query_embedding = self._embed_text(query_text)
+                logger.debug(f"Using vector search with embedding dimension: {len(query_embedding)}")
+                search_query = self.table.search(
+                    query=query_embedding,
+                    vector_column_name="vector",
+                    query_type="vector"
+                )
+                results = search_query.limit(n_results).to_pandas()
+            else:  # text search
+                logger.debug(f"Using text search with query: {query_text}")
+                search_query = self.table.search(
+                    query=query_text,
+                    query_type="fts",
+                    fts_columns=["text"]
+                )
+                results = search_query.limit(n_results).to_pandas()
+
+            # Apply metadata filtering after search, but with improvements
+            if metadata_filter and not results.empty:
+                logger.debug(f"Applying metadata filter: {metadata_filter}")
+                logger.debug(f"Before filtering: {len(results)} results")
+                
+                # Store original results for fallback
+                original_results = results.copy()
+                filtered_results = []
+                
+                # First pass: try to find exact matches
+                for _, row in results.iterrows():
+                    try:
+                        row_metadata = json.loads(row['metadata'])
+                        match = True
+                        
+                        # Check if all filter conditions match
+                        for key, value in metadata_filter.items():
+                            if key not in row_metadata:
+                                match = False
+                                break
+                                
+                            if isinstance(value, (list, tuple)):
+                                # For lists, check if any value matches
+                                if row_metadata[key] not in value:
+                                    match = False
+                                    break
+                            else:
+                                # For single values, check exact match
+                                if row_metadata[key] != value:
+                                    match = False
+                                    break
+                        
+                        if match:
+                            filtered_results.append(row)
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid JSON in metadata: {row['metadata']}")
+                        continue
+                
+                # If no exact matches, try partial matching
+                if not filtered_results:
+                    logger.debug("No exact metadata matches found, trying partial matching")
+                    for _, row in original_results.iterrows():
+                        try:
+                            row_metadata = json.loads(row['metadata'])
+                            match_score = 0
+                            
+                            # Score each metadata field match
+                            for key, value in metadata_filter.items():
+                                if key in row_metadata:
+                                    # For string values, check for substring match
+                                    if isinstance(row_metadata[key], str) and isinstance(value, str):
+                                        if value.lower() in row_metadata[key].lower() or row_metadata[key].lower() in value.lower():
+                                            match_score += 1
+                                    # For list values, check for any overlap
+                                    elif isinstance(row_metadata[key], list) and isinstance(value, (str, list, tuple)):
+                                        if isinstance(value, (list, tuple)):
+                                            if any(v.lower() in str(item).lower() for v in value for item in row_metadata[key]):
+                                                match_score += 1
+                                        else:  # value is string
+                                            if any(value.lower() in str(item).lower() for item in row_metadata[key]):
+                                                match_score += 1
+                                    # For exact matches
+                                    elif row_metadata[key] == value:
+                                        match_score += 1
+                            
+                            # If at least one metadata field matches
+                            if match_score > 0:
+                                row['match_score'] = match_score
+                                filtered_results.append(row)
+                        except json.JSONDecodeError:
+                            continue
+                    
+                    # Sort by match score if we're using partial matching
+                    if filtered_results:
+                        filtered_results = sorted(filtered_results, key=lambda x: x.get('match_score', 0), reverse=True)
+                
+                # If we found results after filtering
+                if filtered_results:
+                    logger.debug(f"After filtering: {len(filtered_results)} results")
+                    results = pd.DataFrame(filtered_results)
+                else:
+                    # No results match filter - return top semantic matches instead of nothing
+                    logger.warning("No results match the metadata filter, returning top semantic matches instead")
+                    results = original_results.head(n_results)
+            
+            # Final limit on results
+            if not results.empty:
+                results = results.head(n_results)
+
+            logger.debug(f"Results: {results}")
+            # Format results
+            formatted_results = []
+            for _, row in results.iterrows():
+                try:
+                    metadata = json.loads(row['metadata'])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(f"Invalid JSON in metadata: {row['metadata']}")
+                    metadata = {}
+                    
+                # Ensure all expected fields are present
+                formatted_result = {
+                    'id': row.get('id', f"doc_{len(formatted_results)}"),
+                    'text': row.get('text', ''),
+                    'metadata': metadata
+                }
+                
+                # Add score if available
+                if '_score' in row:
+                    formatted_result['score'] = float(row['_score'])
+                elif 'combined_score' in row:
+                    formatted_result['score'] = float(row['combined_score'])
+                elif '_distance' in row:
+                    # Convert distance to similarity score
+                    formatted_result['score'] = float(1.0 - row['_distance'])
+                
+                formatted_results.append(formatted_result)
+
+            # Calculate and log performance metrics
+            end_time = pd.Timestamp.now()
+            duration_ms = (end_time - start_time).total_seconds() * 1000
+            logger.info(f"Query completed in {duration_ms:.2f}ms, found {len(formatted_results)} results")
+            
+            # Add performance metrics to the result if in debug mode
+            if logging.getLogger().level == logging.DEBUG:
+                metrics = {
+                    'duration_ms': duration_ms,
+                    'total_results': len(formatted_results),
+                    'search_type': search_type
+                }
+                logger.debug(f"Query metrics: {metrics}")
+            
+            # IMPORTANT: Always return the formatted list of dictionaries, never the pandas DataFrame
+            return formatted_results
+
+        except Exception as e:
+            logger.error(f"Error during query: {str(e)}", exc_info=True)
+            # Return empty results on error
+            return []
+
+    def get_collection_info(self) -> Dict[str, Any]:
+        """Get information about the collection."""
+        try:
+            table_exists = self.collection_name in self.db.table_names()
+            info = {
+                'name': self.collection_name,
+                'exists': table_exists,
+                'count': self.table.count_rows() if table_exists else 0,
+                'search_type': self.search_type
+            }
+
+            return info
+        except Exception as e:
+            logger.error(f"Error getting collection info: {str(e)}")
+            return {
+                'name': self.collection_name,
+                'exists': False,
+                'error': str(e)
+            }
+
+    def cleanup(self):
+        """Remove the existing table and recreate it."""
+        try:
+            if self.collection_name in self.db.table_names():
+                self.db.drop_table(self.collection_name)
+                logger.info(f"Removed table '{self.collection_name}'")
+                
+            # Recreate the table with the proper schema
+            self._create_table()
+            logger.info(f"Recreated table '{self.collection_name}' with proper schema")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+            return False

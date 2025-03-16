@@ -6,8 +6,17 @@ from agno.agent import Agent
 from agno.models.openai import OpenAIChat
 from agno.tools import Toolkit
 from pydantic import BaseModel, Field
-from src.utils.pdf_utils import PDFProcessor
 from src.utils.vector_store import VectorStore
+from agno.document.chunking.semantic import SemanticChunking
+from agno.document.chunking.recursive import RecursiveChunking
+from agno.document.chunking.document import DocumentChunking
+from src.utils.pdf_parser import PDFProcessor
+from src.utils.chunking_utility import ChunkingUtility
+from src.utils.config import Config
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -20,175 +29,112 @@ class ProcessingResult(BaseModel):
     chunk_count: int = Field(description="Number of chunks created")
     error_message: Optional[str] = Field(None, description="Error message if operation failed")
     details: Optional[str] = Field(None, description="Additional details about the operation")
+    chunks: Optional[List[Dict[str, Any]]] = Field(None, description="List of processed document chunks")
+    failed_files: Optional[List[Dict[str, Any]]] = Field(None, description="List of failed files with errors")
 
-class PDFProcessorToolkit(Toolkit):
+class DocumentProcessorToolkit(Toolkit):
     """Toolkit for processing PDF documents."""
-    
+
     def __init__(self):
-        super().__init__(name="pdf_processor")
-        self.register(self.process_pdf_file)
-        self.register(self.process_pdf_directory)
-    
-    def process_pdf_file(self, file_path: str, chunk_size: int = 512, chunk_overlap: int = 128) -> Dict[str, Any]:
+        super().__init__(name="document_processor")
+        self.register(self.process_documents)
+
+        # Get chunking strategy from environment variable
+        chunking_strategy = os.getenv("CHUNKING_STRATEGY", "semantic").lower()
+        chunk_size = int(os.getenv("CHUNK_SIZE", "1024"))
+
+        # Initialize the appropriate chunking strategy
+        if chunking_strategy == "semantic":
+            self.chunking_strategy = SemanticChunking(chunk_size=chunk_size)
+        elif chunking_strategy == "document":
+            self.chunking_strategy = DocumentChunking(chunk_size=chunk_size)
+        elif chunking_strategy == "recursive":
+            self.chunking_strategy = RecursiveChunking(chunk_size=chunk_size)
+        else:
+            logger.warning(f"Unknown chunking strategy '{chunking_strategy}', using 'semantic' instead")
+            self.chunking_strategy = SemanticChunking(chunk_size=chunk_size)
+
+        logger.info(f"Using chunking strategy: {self.chunking_strategy.__class__.__name__}")
+
+        # Initialize PDF processor
+        self.pdf_processor = PDFProcessor()
+
+    def process_documents(self, path: str) -> Dict[str, Any]:
         """
-        Process a single PDF file and return the chunks.
-        
+        Process PDF document(s) from a path and return the chunks.
+
         Args:
-            file_path: Path to the PDF file
-            chunk_size: Size of each text chunk
-            chunk_overlap: Overlap between consecutive chunks
-            
+            path: Path to PDF document file or directory
+
         Returns:
             Dict containing status and results
         """
-        logger.info(f"Processing PDF file: {file_path}")
-        
-        # Create the PDF processor
-        processor = PDFProcessor(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            use_semantic_chunking=True
-        )
-        
-        # Check if file exists
-        if not os.path.exists(file_path):
-            logger.error(f"File does not exist: {file_path}")
+        logger.info(f"Processing PDF document(s) from: {path}")
+
+        # Check if path exists
+        if not os.path.exists(path):
+            logger.error(f"Path does not exist: {path}")
             return {
                 "success": False,
-                "error": f"File {file_path} does not exist",
+                "error": f"Path {path} does not exist",
                 "document_count": 0,
                 "chunk_count": 0
             }
-        
+
         try:
-            # Process the PDF
-            chunks = processor.process_pdf_file(file_path)
-            logger.debug(f"Successfully processed {file_path}: {len(chunks)} chunks")
-            
-            return {
-                "success": True,
-                "chunks": chunks,
-                "document_count": 1,
-                "chunk_count": len(chunks),
-                "details": f"Successfully processed file with {len(chunks)} chunks"
-            }
+            # Process the PDF document(s)
+            result = self.pdf_processor.process_documents(path)
+
+            if not result["success"]:
+                return {
+                    "success": False,
+                    "error": result["error"],
+                    "failed_files": result.get("failed_files"),
+                    "document_count": 0,
+                    "chunk_count": 0
+                }
+
+            # Apply chunking strategy to documents
+            chunking_result = ChunkingUtility.chunk_documents(
+                result["documents"],
+                self.chunking_strategy
+            )
+
+            # Include any failed files from processing step
+            if result.get("failed_files"):
+                chunking_result["failed_files"] = result.get("failed_files", [])
+
+            return chunking_result
+
         except Exception as e:
-            logger.error(f"Error processing file {file_path}: {str(e)}", exc_info=True)
+            logger.error(f"Error processing path {path}: {str(e)}", exc_info=True)
             return {
                 "success": False,
-                "error": f"Error processing file {file_path}: {str(e)}",
+                "error": f"Error processing path {path}: {str(e)}",
                 "document_count": 0,
                 "chunk_count": 0
             }
-    
-    def process_pdf_directory(self, directory_path: str, chunk_size: int = 512, chunk_overlap: int = 128) -> Dict[str, Any]:
-        """
-        Process all PDF files in a directory and return the chunks.
-        
-        Args:
-            directory_path: Path to the directory containing PDF files
-            chunk_size: Size of each text chunk
-            chunk_overlap: Overlap between consecutive chunks
-            
-        Returns:
-            Dict containing status and results
-        """
-        logger.info(f"Processing PDF directory: {directory_path}")
-        
-        # Create the PDF processor
-        processor = PDFProcessor(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            use_semantic_chunking=True
-        )
-        
-        # Check if directory exists
-        if not os.path.exists(directory_path):
-            logger.error(f"Directory does not exist: {directory_path}")
-            return {
-                "success": False,
-                "error": f"Directory {directory_path} does not exist",
-                "document_count": 0,
-                "chunk_count": 0
-            }
-        
-        # Get list of PDF files
-        pdf_files = glob.glob(os.path.join(directory_path, "*.pdf"))
-        logger.debug(f"Found {len(pdf_files)} PDF files in {directory_path}")
-        
-        if not pdf_files:
-            logger.warning(f"No PDF files found in {directory_path}")
-            return {
-                "success": False,
-                "error": f"No PDF files found in {directory_path}",
-                "document_count": 0,
-                "chunk_count": 0
-            }
-        
-        # Process each PDF file
-        all_chunks = []
-        processed_files = []
-        failed_files = []
-        
-        for pdf_file in pdf_files:
-            try:
-                logger.debug(f"Processing file: {pdf_file}")
-                # Process the PDF
-                chunks = processor.process_pdf_file(pdf_file)
-                
-                # Add to results
-                all_chunks.extend(chunks)
-                processed_files.append(os.path.basename(pdf_file))
-                logger.debug(f"Successfully processed {pdf_file}: {len(chunks)} chunks")
-            except Exception as e:
-                logger.error(f"Error processing file {pdf_file}: {str(e)}", exc_info=True)
-                failed_files.append({
-                    "file": os.path.basename(pdf_file),
-                    "error": str(e)
-                })
-        
-        # Check if any files were processed successfully
-        if not processed_files:
-            return {
-                "success": False,
-                "error": "Failed to process any files",
-                "failed_files": failed_files,
-                "document_count": 0,
-                "chunk_count": 0
-            }
-        
-        # Return success with any partially successful results
-        return {
-            "success": True,
-            "chunks": all_chunks,
-            "processed_files": processed_files,
-            "failed_files": failed_files if failed_files else None,
-            "document_count": len(processed_files),
-            "chunk_count": len(all_chunks),
-            "details": f"Successfully processed {len(processed_files)} files with {len(all_chunks)} total chunks"
-        }
 
 class VectorStoreToolkit(Toolkit):
     """Toolkit for managing vector store operations."""
-    
+
     def __init__(self, vector_store: VectorStore):
         super().__init__(name="vector_store_manager")
         self.vector_store = vector_store
         self.register(self.add_documents)
         self.register(self.get_collection_info)
-    
+
     def add_documents(self, documents: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Add documents to the vector store.
-        
+
         Args:
             documents: List of document chunks to add
-            
+
         Returns:
             Dict containing operation status and results
         """
         try:
-            # Add documents to vector store
             self.vector_store.add_documents(documents)
             return {
                 "success": True,
@@ -202,23 +148,29 @@ class VectorStoreToolkit(Toolkit):
                 "error": f"Error adding documents to vector store: {str(e)}",
                 "document_count": 0
             }
-    
+
     def get_collection_info(self) -> Dict[str, Any]:
         """
         Get information about the vector store collection.
-        
+
         Returns:
             Dict containing collection information
         """
         try:
-            # Get count of items in collection
-            collection_count = self.vector_store.collection.count()
-            return {
-                "success": True,
-                "collection_name": self.vector_store.collection_name,
-                "document_count": collection_count,
-                "details": f"Collection '{self.vector_store.collection_name}' contains {collection_count} document chunks"
-            }
+            if self.vector_store.collection_name in self.vector_store.client.table_names():
+                table = self.vector_store.client.open_table(self.vector_store.collection_name)
+                collection_count = len(table.to_pandas())
+                return {
+                    "success": True,
+                    "collection_name": self.vector_store.collection_name,
+                    "document_count": collection_count,
+                    "details": f"Collection '{self.vector_store.collection_name}' contains {collection_count} document chunks"
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": f"Collection '{self.vector_store.collection_name}' does not exist"
+                }
         except Exception as e:
             logger.error(f"Error getting collection info: {str(e)}", exc_info=True)
             return {
@@ -227,187 +179,120 @@ class VectorStoreToolkit(Toolkit):
             }
 
 class DocumentProcessorAgent:
-    """
-    Agent responsible for processing documents and creating a knowledge base.
-    
-    This agent:
-    1. Processes PDF documents from a specified directory
-    2. Extracts and chunks text from the documents
-    3. Creates and updates a ChromaDB vector store with the document chunks
-    """
-    
-    def __init__(self, 
-                 model_id: str = "gpt-4o", 
+    """Agent for processing PDF documents."""
+
+    def __init__(self, model_id: str = "gpt-4o",
                  documents_dir: str = "./data/documents",
-                 vector_store: VectorStore = None,
-                 chunk_size: int = 512,
-                 chunk_overlap: int = 128):
-        """
-        Initialize the Document Processor Agent.
-        
-        Args:
-            model_id: ID of the OpenAI model to use
-            documents_dir: Directory containing PDF documents
-            vector_store: Vector store for document storage
-            chunk_size: Maximum size of document chunks
-            chunk_overlap: Overlap between chunks
-        """
-        # Create directories if they don't exist
-        os.makedirs(documents_dir, exist_ok=True)
-        
-        # Set up agent config
+                 vector_store: VectorStore = None):
         self.model_id = model_id
         self.documents_dir = documents_dir
         self.vector_store = vector_store
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
-        
-        # Initialize document processor
-        self.pdf_processor = PDFProcessor(
-            chunk_size=chunk_size, 
-            chunk_overlap=chunk_overlap
-        )
-        
-        # Create tools for the agent
-        tools = self.get_tools()
-        
-        # Initialize the agent with specialized instructions
+        self.vector_store_toolkit = VectorStoreToolkit(vector_store)
+        self.document_processor = DocumentProcessorToolkit()
+
+        # Initialize the agent with detailed instructions
         self.agent = Agent(
             name="Document Processor",
-            model=OpenAIChat(id=model_id),
-            description="Specialized agent for document processing and knowledge base management",
+            model=OpenAIChat(id=self.model_id, api_key=Config.OPENAI_API_KEY),
+            description="Specialized agent for processing and analyzing PDF documents",
             instructions=[
-                "You are a document processing specialist responsible for building and managing a knowledge base.",
-                
-                "Step 1: Document Processing",
-                "- When asked to process documents, scan the specified directory for PDF files",
-                "- Extract and chunk text from each document while preserving metadata",
-                "- Report any processing errors or issues encountered with specific files",
-                
-                "Step 2: Knowledge Base Management",
-                "- Add processed document chunks to the vector store",
-                "- Verify documents were successfully added to the knowledge base",
-                "- Provide detailed information about the knowledge base contents when requested",
-                
+                "You are an expert document processor responsible for analyzing and processing PDF documents.",
+                "Your tasks include:",
+                "1. Processing PDF documents using LlamaCloud Parsing",
+                "2. Applying appropriate chunking strategies",
+                "3. Managing the vector store for document storage",
+                "4. Handling various document structures",
+                "5. Ensuring proper metadata extraction and storage",
+
                 "Important Guidelines:",
-                "- Always handle files carefully and report any errors in detail",
-                "- Provide clear summaries of processing results including document counts",
-                "- If a processing request fails, explain the reason and suggest potential solutions",
-                "- Never make up information about document processing results",
-                
-                "When reporting results:",
-                "1. State whether the operation was successful",
-                "2. Include the number of documents processed and chunks created",
-                "3. List any files that failed processing and why",
-                "4. Provide recommendations for fixing any issues"
+                "- Process documents efficiently and accurately",
+                "- Handle errors gracefully and provide clear feedback",
+                "- Maintain document integrity during processing",
+                "- Apply appropriate chunking based on content type",
+                "- Ensure proper vector store management"
             ],
-            tools=tools,
-            structured_outputs=ProcessingResult,
+            tools=[self.document_processor, self.vector_store_toolkit],
             markdown=True,
             debug_mode=True,
             show_tool_calls=True
         )
-    
-    def process_documents(self) -> ProcessingResult:
-        """
-        Process all PDF documents in the documents directory and add them to the vector store.
-        
-        Returns:
-            ProcessingResult containing information about the processing operation
-        """
+
+    def process_and_store_document(self, document_path: str) -> ProcessingResult:
+        """Process a PDF document and store it in the vector store."""
         try:
-            # Check if the documents directory exists and contains PDF files
-            if not os.path.exists(self.documents_dir):
+            # Process the document
+            result = self.document_processor.process_documents(document_path)
+
+            if not result["success"]:
                 return ProcessingResult(
                     success=False,
                     document_count=0,
                     chunk_count=0,
-                    error_message=f"Documents directory not found: {self.documents_dir}"
+                    error_message=result["error"],
+                    failed_files=result.get("failed_files")
                 )
-            
-            # Get count of PDF files in the directory
-            pdf_files = [f for f in os.listdir(self.documents_dir) if f.lower().endswith('.pdf')]
-            if not pdf_files:
+
+            # Store chunks in vector store
+            chunks = result["chunks"]
+            store_result = self.vector_store_toolkit.add_documents(chunks)
+
+            if not store_result["success"]:
                 return ProcessingResult(
                     success=False,
-                    document_count=0,
+                    document_count=result["document_count"],
                     chunk_count=0,
-                    error_message=f"No PDF files found in {self.documents_dir}"
+                    error_message=f"Failed to store chunks: {store_result.get('error', 'Unknown error')}",
+                    failed_files=result.get("failed_files")
                 )
-            
-            # Process PDF files using the PDF processor toolkit
-            processing_result = self.pdf_processor.process_pdf_directory(
-                self.documents_dir, 
-                chunk_size=self.chunk_size, 
-                chunk_overlap=self.chunk_overlap
-            )
-            
-            if not processing_result["success"]:
-                return ProcessingResult(
-                    success=False,
-                    document_count=0,
-                    chunk_count=0,
-                    error_message=processing_result.get("error", "Unknown processing error")
-                )
-            
-            # Add document chunks to vector store using the vector store toolkit
-            storage_result = self.vector_store.add_documents(processing_result["chunks"])
-            
-            # Return success result
+
             return ProcessingResult(
                 success=True,
-                document_count=len(pdf_files),
-                chunk_count=len(processing_result["chunks"]),
-                details=f"Successfully processed {len(pdf_files)} documents and created {len(processing_result['chunks'])} chunks"
+                document_count=result["document_count"],
+                chunk_count=result["chunk_count"],
+                details=f"Successfully processed and stored {result['chunk_count']} chunks from {result['document_count']} documents",
+                chunks=chunks,
+                failed_files=result.get("failed_files")
             )
-            
+
         except Exception as e:
-            # Return error result
+            logger.error(f"Error processing document {document_path}: {str(e)}", exc_info=True)
             return ProcessingResult(
                 success=False,
                 document_count=0,
                 chunk_count=0,
-                error_message=str(e)
+                error_message=f"Error processing document: {str(e)}"
             )
-    
+
     def get_document_info(self) -> str:
-        """
-        Get information about the documents in the knowledge base.
-        
-        Returns:
-            String with information about the documents
-        """
+        """Get information about the documents in the vector store."""
         try:
-            # Get count of items in the collection
-            collection_count = self.vector_store.collection.count()
-            
-            # Get list of PDF files
-            pdf_files = [f for f in os.listdir(self.documents_dir) if f.lower().endswith('.pdf')]
-            
-            # Format information
-            info = f"Knowledge Base Information:\n"
-            info += f"- Total documents: {len(pdf_files)}\n"
-            info += f"- Total chunks in vector store: {collection_count}\n"
-            info += f"- Document sources:\n"
-            
-            for pdf_file in pdf_files:
-                file_path = os.path.join(self.documents_dir, pdf_file)
-                file_size = os.path.getsize(file_path) / (1024 * 1024)  # Convert to MB
-                info += f"  - {pdf_file} ({file_size:.2f} MB)\n"
-                
-            return info
-            
+            collection_info = self.vector_store_toolkit.get_collection_info()
+
+            if not collection_info["success"]:
+                return f"Error retrieving collection info: {collection_info.get('error', 'Unknown error')}"
+
+            # Get available PDF documents
+            available_documents = glob.glob(os.path.join(self.documents_dir, "*.pdf"))
+
+            # Format the information
+            info = [
+                "# Document Knowledge Base Information",
+                "",
+                f"## Vector Store: {collection_info['collection_name']}",
+                f"- Total document chunks: {collection_info['document_count']}",
+                f"- Chunking strategy: {self.document_processor.chunking_strategy.__class__.__name__}",
+                "",
+                "## Available PDF Documents",
+            ]
+
+            if available_documents:
+                for doc in available_documents:
+                    info.append(f"- {os.path.basename(doc)}")
+            else:
+                info.append("- No PDF documents available in the documents directory")
+
+            return "\n".join(info)
+
         except Exception as e:
+            logger.error(f"Error getting document info: {str(e)}", exc_info=True)
             return f"Error getting document information: {str(e)}"
-
-    def get_tools(self):
-        """Get document processing tools for the Agno agent."""
-        tools = [
-            PDFProcessorToolkit(),
-            VectorStoreToolkit(self.vector_store) if self.vector_store else None
-        ]
-        return [tool for tool in tools if tool]
-
-# For backward compatibility
-PDFDirectoryProcessorTool = PDFProcessorToolkit
-PDFFileTool = PDFProcessorToolkit 

@@ -1,10 +1,10 @@
-from typing import Dict, Any, List, Optional, Literal
-from agno.agent import Agent, RunResponse
+from typing import Dict, Any, Optional, Literal, List
+from agno.agent import Agent
 from agno.models.openai import OpenAIChat
 from agno.tools import Toolkit
 from pydantic import BaseModel, Field
 import logging
-from src.models.response_settings import ResponseSettings
+from src.utils.config import Config
 from src.utils.vector_store import VectorStore
 
 from .document_processor_agent import DocumentProcessorAgent
@@ -17,167 +17,388 @@ logger = logging.getLogger("OrchestratorAgent")
 class QueryAnalysisResult(BaseModel):
     """Structured result from user query analysis."""
     refined_query: str = Field(description="The refined, clear version of the user's query")
-    search_strategy: str = Field(description="Strategy for searching the knowledge base")
     meta_filters: Optional[Dict[str, Any]] = Field(None, description="Optional metadata filters to apply")
-    is_document_management: bool = Field(default=False, description="Whether the query is about document management")
     expected_result_type: str = Field(description="Type of result expected (e.g., 'factual', 'summary', 'explanation')")
 
 # Define response format types
 ResponseFormat = Literal["concise", "balanced", "detailed"]
 
-class ResponseGeneratorToolkit(Toolkit):
-    """Toolkit for generating responses based on retrieved information."""
+class ResponseSettings(BaseModel):
+    """Settings for customizing response format and content."""
+    verbosity: ResponseFormat = Field(
+        default=Config.RESPONSE_FORMAT, 
+        description="How detailed the response should be"
+    )
+    max_length: Optional[int] = Field(
+        default=Config.MAX_RESPONSE_LENGTH, 
+        description="Maximum length of the response in characters (approximate)"
+    )
+    format_markdown: bool = Field(
+        default=Config.FORMAT_MARKDOWN, 
+        description="Whether to format the response using markdown"
+    )
     
-    def __init__(self, response_settings: ResponseSettings):
+    def format_response(self, response) -> str:
+        """
+        Format a response based on these settings.
+        
+        Args:
+            response: The raw response text or Agno RunResponse object
+            
+        Returns:
+            A formatted, human-readable response
+        """
+        # If response is None or empty, return a default message
+        if response is None:
+            return "No response generated."
+        
+        # Convert response to string, handling various response types
+        if not isinstance(response, str):
+            try:
+                # Simple string conversion, which should work for most objects
+                response = str(response)
+            except Exception as e:
+                logger.error(f"Error converting response to string: {str(e)}")
+                return f"Error formatting response: {str(e)}"
+        
+        # Ensure response is a string at this point
+        if not isinstance(response, str):
+            return "Error: Could not convert response to string."
+        
+        # Clean up the response
+        response = response.strip()
+        
+        # For concise responses, ensure they're really concise
+        if self.verbosity == "concise":
+            # Strip any markdown headers
+            response = response.replace("# ", "").replace("## ", "").replace("### ", "")
+            
+            # Split into sentences and limit if too many
+            sentences = [s.strip() for s in response.split('.') if s.strip()]
+            if len(sentences) > 5:
+                sentences = sentences[:5]
+                response = ". ".join(sentences) + "."
+            
+            # Remove any citation blocks at the end
+            if "Sources:" in response:
+                response = response.split("Sources:")[0].strip()
+        
+        # Apply max_length constraint if specified
+        if self.max_length and len(response) > self.max_length:
+            response = response[:self.max_length-3] + "..."
+            
+        return response
+
+
+class ResponseGeneratorToolkit(Toolkit):
+    """Toolkit for generating well-structured responses based on retrieved information."""
+
+    def __init__(self, response_settings: ResponseSettings, model: OpenAIChat):
         super().__init__(name="response_generator")
         self.response_settings = response_settings
+        self.model = model
         self.register(self.generate_response)
-    
-    def generate_response(self, context: str, query: str) -> Dict[str, Any]:
+
+    def generate_response(self, context: str, query: str, expected_result_type: str = "factual") -> Dict[str, Any]:
         """
-        Generate a response based on the retrieved context and query.
-        
+        Generate a response based on retrieved context information and the original query.
+
         Args:
             context: The retrieved context information
             query: The user's original query
-            
+            expected_result_type: Type of result expected (factual, procedural, etc.)
+
         Returns:
-            Formatted response dict
+            Dictionary containing:
+                - response: The generated response text
+                - query: The original user query
+                - success: Whether generation was successful
         """
-        # Create a prompt for generating a response
-        prompt = self._create_response_prompt(query, context, self.response_settings)
-        
-        # Return a properly structured response object that Agno can use
-        return {
-            "response": prompt,  # The Agno agent will process this prompt to generate the actual response
-            "prompt": prompt,
-            "query": query,
-            "context": context,
-            "settings": self.response_settings.dict()
-        }
-    
-    def _create_response_prompt(self, query: str, context: str, settings: ResponseSettings) -> str:
-        """
-        Create a prompt for generating a response with the appropriate format.
-        
-        Args:
-            query: The user's query
-            context: Retrieved context information
-            settings: Response format settings
-            
-        Returns:
-            Formatted prompt for the agent
-        """
+        try:
+            # Create a prompt for generating a response
+            prompt = self._create_response_prompt(query, context,
+                                                 self.response_settings,
+                                                 expected_result_type)
+
+            # Generate the actual response using the model
+            if self.model:
+                # Instead of trying to use Message directly, call OpenAI API through client
+                try:
+                    # If we have direct access to the openai client
+                    if hasattr(self.model, 'client'):
+                        # Use the OpenAI client
+                        response = self.model.client.chat.completions.create(
+                            model=self.model.id,
+                            messages=[{"role": "user", "content": prompt}]
+                        )
+                        response_text = response.choices[0].message.content
+                        logger.debug(f"Got string content from response: {len(response_text)} chars")
+                    else:
+                        # Use the model's invoke method with simple string conversion handling
+                        from agno.models.message import Message
+                        message = Message(role="user", content=prompt)
+                        response = self.model.invoke([message])
+                        
+                        # Extract content as string - use string representation if it's not already a string
+                        if hasattr(response, 'content'):
+                            if isinstance(response.content, str):
+                                response_text = response.content
+                                logger.debug(f"Got string content from response: {len(response_text)} chars")
+                            else:
+                                # Convert non-string content to string (e.g., dict to string)
+                                logger.warning(f"response.content is not a string but {type(response.content)}. Converting to string.")
+                                logger.debug(f"Content value: {response.content}")
+                                response_text = str(response.content)
+                        elif hasattr(response, 'choices') and len(response.choices) > 0:
+                            response_text = response.choices[0].message.content
+                            logger.debug(f"Got content from response.choices: {len(response_text)} chars")
+                        else:
+                            logger.warning("Could not extract content from model response")
+                            response_text = "No response generated."
+                except Exception as e:
+                    logger.error(f"Error with model.invoke: {str(e)}")
+                    # Fallback in case of error
+                    response_text = f"Error generating response: {str(e)}"
+            else:
+                logger.warning("No model provided to ResponseGeneratorToolkit")
+                response_text = "No response model available to generate a response."
+
+            # Format the response according to settings
+            formatted_response = self.response_settings.format_response(response_text)
+
+            return {
+                "response": formatted_response,
+                "query": query,
+                "success": True
+            }
+
+        except Exception as e:
+            logger.error(f"Error generating response: {str(e)}", exc_info=True)
+            return {
+                "response": f"I found relevant information but encountered an error generating a response: {str(e)}",
+                "query": query,
+                "success": False,
+                "error": str(e)
+            }
+
+    def _create_response_prompt(self, query: str, context: str,
+                               settings: ResponseSettings,
+                               expected_result_type: str = "factual") -> str:
+        """Create a prompt for generating a response with the appropriate format."""
         # Define formatting instructions based on verbosity
         formatting_instructions = {
-            "concise": """
-                Write a VERY brief and direct answer. 
-                - Use plain language with minimal technical terms
-                - Maximum 2-3 sentences total
-                - No introductions or background information
-                - Just give the direct answer to the query
-                - Avoid all unnecessary words and phrases
-            """,
-            "balanced": """
-                Provide a complete but balanced response. Include relevant details while avoiding excessive information.
-                Aim for around 200-300 words. Use clear headings and bullet points when appropriate.
-                Explain key concepts but avoid unnecessary depth.
-            """,
-            "detailed": """
-                Provide a comprehensive and detailed response. Include in-depth explanations and context.
-                Use multiple headings, lists, and well-structured sections to organize information.
-                Explore relevant related concepts and provide a thorough analysis.
-            """
+            "concise": "Write a VERY brief and direct answer (2-3 sentences). Use plain language with minimal technical terms. No introductions or background information.",
+            "balanced": "Provide a complete but balanced response with relevant details (200-300 words). Use clear headings and bullet points when appropriate.",
+            "detailed": "Provide a comprehensive and detailed response with in-depth explanations. Use multiple headings, lists, and well-structured sections."
         }
-        
-        # Define citation instructions
-        citation_instructions = """
-            Include specific citations to source documents using the format [Document X: Source Name (page Y)].
-            Place citations directly after the information they support.
-        """ if settings.include_citations else """
-            Do not include explicit citations in your response.
-        """
-        
-        # Define sources section instructions
-        sources_section_instructions = """
-            Include a "Sources" section at the end listing all documents referenced.
-        """ if settings.include_sources_section else ""
-        
+
+        # Result type specific instructions
+        result_type_instructions = {
+            "factual": "Focus on accurate facts and specific details. Be precise and direct.",
+            "procedural": "Present clear step-by-step instructions in a logical sequence. Number steps when appropriate.",
+            "conceptual": "Explain concepts thoroughly with clear definitions and examples.",
+            "opinion": "Present a balanced view of different perspectives based only on the retrieved information."
+        }
+
         # Define length constraint
-        length_constraint = f"""
-            Keep your response to approximately {settings.max_length} characters in length.
-        """ if settings.max_length else ""
-        
-        # Add strict RAG instructions
-        rag_instructions = """
-            CRITICAL: Only use information from the provided context. DO NOT include any information that is not present in the retrieved documents.
-            If the retrieved documents don't contain enough information to fully answer the query, acknowledge this limitation explicitly.
-            Never hallucinate or make up information not present in the retrieved documents.
-        """
-        
+        length_constraint = (
+            f"Keep your response to approximately {settings.max_length} characters in length."
+            if settings.max_length else
+            ""
+        )
+
         # Create the prompt
         prompt = f"""
         Generate a {settings.verbosity} response to the user's query based on the retrieved information.
-        
+
         User Query: "{query}"
-        
+
         Retrieved Context:
         {context}
-        
-        {rag_instructions}
-        
+
+        CRITICAL: Only use information from the provided context. DO NOT include any information not present in the documents.
+
         Your response should:
         1. Directly answer the query with relevant information from the retrieved documents
         2. {formatting_instructions[settings.verbosity]}
-        3. {citation_instructions}
-        4. {sources_section_instructions}
-        5. {length_constraint}
-        6. If information is contradictory between sources, acknowledge this and explain the different perspectives
-        7. If the retrieved documents don't contain an answer to the question, clearly state this and do not make up information
-        8. Format your response in a clean, human-readable way with proper spacing and structure
-        
-        Remember: You are a Retrieval-Augmented Generation system. You can ONLY provide information that exists in the retrieved documents.
+        3. {result_type_instructions.get(expected_result_type, result_type_instructions["factual"])}
+        4. {length_constraint}
+        5. If information is contradictory between sources, acknowledge this and explain the different perspectives
+        6. If the retrieved documents don't contain an answer, clearly state this and do not make up information
+
+        Remember: You are a Retrieval-Augmented Generation system. You can ONLY provide information from the retrieved documents.
         """
-        
+
         return prompt
 
-# Maintain the old class name as an alias for backward compatibility
-ResponseGeneratorTool = ResponseGeneratorToolkit
+
+class QueryAnalyzerToolkit(Toolkit):
+    """
+    Toolkit for analyzing user queries to optimize retrieval.
+
+    This toolkit analyzes queries to extract key information that helps
+    tailor the retrieval process to the specific query characteristics.
+    It determines query refinements, metadata filters, and expected result types
+    to improve search relevance and response quality.
+    """
+
+    def __init__(self, model: OpenAIChat):
+        super().__init__(name="query_analyzer")
+        self.register(self.analyze_query)
+        self.model = model
+
+    def analyze_query(self, query: str) -> str:
+        """
+        Analyze a user query to extract key information for optimizing retrieval.
+
+        Args:
+            query: The original user query text
+
+        Returns:
+            A JSON string containing refined query, metadata filters, and expected result type
+        """
+        try:
+            # Create analysis prompt
+            analysis_prompt = f"""
+            Analyze the following user query:
+
+            "{query}"
+
+            Your task is to:
+            1. Refine the query for optimal retrieval
+            2. Identify any metadata filters that should be applied
+            3. Identify the expected result type (factual, conceptual, procedural, opinion)
+
+            Respond with a JSON object containing:
+            {{
+            "refined_query": "Your refined query here",
+            "meta_filters": {{"key1": "value1", "key2": "value2"}},
+            "expected_result_type": "factual|conceptual|procedural|opinion"
+            }}
+            """
+
+            # Get response from model
+            response_text = ""
+            if self.model:
+                try:
+                    # Use the model's invoke method
+                    from agno.models.message import Message
+                    message = Message(role="user", content=analysis_prompt)
+                    analysis_response = self.model.invoke([message])
+                    logger.info(f"Analysis response: {analysis_response}")
+                    
+                    # Extract content as string
+                    if hasattr(analysis_response, 'choices') and analysis_response.choices:
+                        response_text = analysis_response.choices[0].message.content
+                        logger.info(f"Got string content from response: {len(response_text)} chars")
+                    else:
+                        logger.info("Could not extract content from model response")
+                        response_text = "No response generated."
+                except Exception as e:
+                    logger.error(f"Error with model.invoke: {str(e)}")
+            
+            # Parse JSON from response
+            import json
+            import re
+            
+            # Try to find JSON in the response
+            json_match = re.search(r'({.*})', response_text.replace('\n', ' '), re.DOTALL)
+            if json_match:
+                analysis_dict = json.loads(json_match.group(1))
+                
+                result = {
+                    "refined_query": analysis_dict.get("refined_query", query),
+                    "meta_filters": analysis_dict.get("meta_filters", {}),
+                    "expected_result_type": analysis_dict.get("expected_result_type", "factual")
+                }
+                
+                return json.dumps(result)
+
+            # If no valid JSON found, use fallback analysis
+            logger.warning("No valid JSON found in response, using fallback analysis")
+            
+            # Basic fallback logic
+            meta_filters = {}
+            if "encryption" in query.lower():
+                meta_filters["feature"] = "encryption"
+            if "ssl" in query.lower() or "tls" in query.lower():
+                meta_filters["feature"] = "ssl"
+            if any(db in query.lower() for db in ["oracle", "sql server", "odbc", "jdbc"]):
+                for db_type in ["oracle", "sqlserver", "odbc", "jdbc"]:
+                    if db_type in query.lower():
+                        meta_filters["driver_type"] = db_type
+                        break
+            
+            # Determine expected result type
+            expected_result_type = "factual"  # default
+            if any(term in query.lower() for term in ["how to", "steps", "procedure", "configure"]):
+                expected_result_type = "procedural"
+            elif any(term in query.lower() for term in ["explain", "concept", "understand"]):
+                expected_result_type = "conceptual"
+            elif any(term in query.lower() for term in ["opinion", "best", "recommend"]):
+                expected_result_type = "opinion"
+
+            result = {
+                "refined_query": query,
+                "meta_filters": meta_filters,
+                "expected_result_type": expected_result_type
+            }
+            
+            return json.dumps(result)
+
+        except Exception as e:
+            logger.error(f"Error analyzing query: {str(e)}", exc_info=True)
+            # Simple error fallback
+            return json.dumps({
+                "refined_query": query,
+                "meta_filters": {},
+                "expected_result_type": "factual"
+            })
 
 class OrchestratorAgent:
     """
-    Agent responsible for orchestrating the document processing and retrieval.
+    Master agent responsible for coordinating the entire RAG system workflow.
     
-    This agent:
-    1. Takes user input and determines appropriate actions
-    2. Transforms vague queries into detailed instructions
-    3. Coordinates document processor and retriever agents
-    4. Formats information for the user
+    This agent serves as the central coordinator for the multi-agent RAG system,
+    managing the flow of information between different specialized agents and
+    ensuring that user queries are properly processed and answered.
+    
+    Key responsibilities:
+    1. Analyzing and refining user queries to determine information needs
+    2. Delegating document processing tasks to the DocumentProcessorAgent
+    3. Delegating information retrieval tasks to the RetrieverAgent
+    4. Generating comprehensive and accurate responses based on retrieved information
+    5. Managing conversation context and handling special commands
+    6. Coordinating the overall system workflow and agent interactions
+    
+    The OrchestratorAgent makes high-level decisions about how to process queries,
+    while delegating specialized tasks to other agents that have specific expertise.
     """
     
     def __init__(self, 
-                 model_id: str = "gpt-4o",
-                 documents_dir: str = "./data/documents",
+                 model_id: str = Config.MODEL_ID,
+                 documents_dir: str = Config.DOCUMENTS_DIR,
                  vector_store: VectorStore = None,
-                 default_response_format: ResponseFormat = "balanced"):
+                 use_reranking: bool = Config.USE_RERANKING,
+                 default_response_format: ResponseFormat = Config.RESPONSE_FORMAT):
         """
-        Initialize the Orchestrator Agent.
+        Initialize the Orchestrator Agent with configuration and child agents.
         
         Args:
-            model_id: ID of the OpenAI model to use
-            documents_dir: Directory containing PDF documents
-            vector_store: Vector store instance for document storage and retrieval
+            model_id: ID of the LLM model to use for the orchestrator
+            documents_dir: Directory containing documents to be processed
+            vector_store: Vector store for document storage and retrieval
+            use_reranking: Whether to use reranking to improve search results
             default_response_format: Default verbosity level for responses
         """
-        # Set up agent config
+        # Set up basic configuration
         self.model_id = model_id
         self.documents_dir = documents_dir
         self.vector_store = vector_store
-        
-        # Set default response settings
-        self.default_response_settings = ResponseSettings(
-            verbosity=default_response_format
-        )
+        self.default_response_settings = ResponseSettings(verbosity=default_response_format)
+        self.default_response_settings.max_length = Config.MAX_RESPONSE_LENGTH
+        self.default_response_settings.verbosity = Config.RESPONSE_FORMAT
+        self.model = OpenAIChat(id=model_id, api_key=Config.OPENAI_API_KEY)
         
         # Initialize child agents
         self.document_processor = DocumentProcessorAgent(
@@ -188,16 +409,18 @@ class OrchestratorAgent:
         
         self.retriever = RetrieverAgent(
             model_id=model_id,
-            vector_store=self.vector_store
+            vector_store=self.vector_store,
+            cohere_api_key=Config.COHERE_API_KEY
         )
         
-        # Create tools for the agent
-        tools = self.get_tools(self.default_response_settings)
+        # Create toolkits
+        self.query_analyzer_toolkit = QueryAnalyzerToolkit(model=self.model)
+        self.response_generator_toolkit = ResponseGeneratorToolkit(self.default_response_settings, model=self.model)
         
         # Initialize the agent with specialized instructions
         self.agent = Agent(
             name="Orchestrator",
-            model=OpenAIChat(id=model_id),
+            model=self.model,
             description="Master orchestrator agent that coordinates document processing and retrieval operations",
             instructions=[
                 "You are the primary coordinator of a multi-agent system for document retrieval.",
@@ -207,19 +430,36 @@ class OrchestratorAgent:
                 "- Refine vague or unclear queries into detailed, actionable instructions",
                 "- Determine if the query requires document processing or information retrieval",
                 "- Identify key concepts, entities, and metadata filters relevant to the query",
+                "- Determine the expected result type (factual, conceptual, procedural, opinion)",
+                "- Provide context about your analysis to the tools to aid their reasoning",
+                
+                "For DataDirect documentation queries:",
+                "- Recognize product names (DataDirect Connect, ODBC, JDBC, ADO.NET)",
+                "- Identify specific drivers (Oracle, SQL Server, DB2, etc.)",
+                "- Understand common features (connection pooling, SSL/TLS, encryption)",
+                "- Categorize query types (configuration, troubleshooting, reference)",
+                "- Extract version information when present",
                 
                 "Step 2: Task Delegation",
                 "- Route document processing requests to the Document Processor Agent",
-                "- Route information retrieval queries to the Retriever Agent", 
+                "- Delegate information retrieval tasks to the RetrieverAgent with appropriate context", 
+                "- Provide the RetrieverAgent with your query analysis to inform its search strategy",
+                "- Allow the RetrieverAgent to make decisions about search methods and result evaluation",
                 "- Monitor the progress and results of delegated tasks",
-                "- Ensure consistent communication format between agents",
                 
                 "Step 3: Response Generation",
                 "- Generate comprehensive and accurate responses based on retrieved information",
-                "- Format responses according to specified verbosity level and citation preferences",
+                "- Format responses according to specified verbosity level",
                 "- Ensure responses directly address the user's query with relevant information",
                 "- Apply appropriate formatting for readability and clarity",
-                "- Include proper citations and source references when required",
+                "- Use only information from the retrieved documents in your responses",
+                
+                "For DataDirect documentation responses:",
+                "- Include relevant connection string attributes when discussing configuration",
+                "- Provide complete code examples when showing implementation steps",
+                "- Format error codes and messages in a clear, readable way",
+                "- Organize troubleshooting steps in a logical sequence",
+                "- Include version compatibility information when relevant",
                 
                 "Step 4: Conversation Management",
                 "- Maintain context across multiple interactions in the conversation",
@@ -228,17 +468,17 @@ class OrchestratorAgent:
                 "- Handle system commands and formatting requests appropriately",
                 
                 "Important Guidelines:",
+                "- Respect the expertise of specialized tools - let them make decisions",
+                "- Provide clear context when delegating tasks to the tools",
                 "- Always prioritize accuracy and relevance in responses",
                 "- Only provide information that can be sourced from the knowledge base",
                 "- Acknowledge limitations when requested information is not available",
-                "- Present information in a structured, coherent manner",
-                "- Format responses according to the specified verbosity level",
-                "- Provide appropriate citations for all retrieved information when required"
+                "- Present information in a structured, coherent manner"
             ],
-            team=[self.document_processor.agent, self.retriever.agent],  # Set up team structure
-            tools=tools,  # Pass tools to the agent
+            tools=[self.query_analyzer_toolkit, self.response_generator_toolkit],  # Pass tools to the agent
             read_chat_history=True,  # Enable chat history access
-            structured_outputs=QueryAnalysisResult,  # For internal analysis
+            response_model=QueryAnalysisResult,  # For internal analysis
+            structured_outputs=True,  # For internal analysis
             markdown=True,
             debug_mode=True,  # Enable debug mode to see detailed logs
             show_tool_calls=True  # Show when and how tools are called
@@ -246,188 +486,194 @@ class OrchestratorAgent:
     
     def process_documents(self) -> str:
         """
-        Process documents using the Document Processor Agent.
+        Process documents in the specified directory and store them in the vector database.
+        
+        This method delegates document processing to the DocumentProcessorAgent, which:
+        1. Reads documents from the configured documents directory
+        2. Chunks the documents into manageable pieces
+        3. Processes and embeds the chunks
+        4. Stores the embedded chunks in the vector database
         
         Returns:
-            Status message about document processing
+            A formatted string with the processing results, including:
+            - Success/failure status
+            - Number of documents processed
+            - Number of chunks created
+            - Additional details about the processing operation
         """
-        # Delegate document processing to the document processor agent
-        result = self.document_processor.process_documents()
+        logger.info("Orchestrator requesting document processing")
+        processing_result = self.document_processor.process_and_store_document(self.documents_dir)
         
-        if result.success:
-            return f"✅ {result.details}"
+        if processing_result.success:
+            return f"✅ Successfully processed {processing_result.document_count} documents with {processing_result.chunk_count} chunks.\n\n{processing_result.details}"
         else:
-            return f"❌ Document processing failed: {result.error_message}"
+            return f"❌ Document processing failed: {processing_result.error_message}\n\n{processing_result.details if processing_result.details else ''}"
     
-    def analyze_query(self, query: str) -> QueryAnalysisResult:
-        """
-        Analyze the user query to determine the appropriate action.
-        
-        Args:
-            query: User's query text
-            
-        Returns:
-            QueryAnalysisResult with analysis of the query
-        """
-        # Use the agent to analyze the query
-        prompt = f"""
-        Analyze the following user query and provide a structured response:
-        
-        User Query: "{query}"
-        
-        Your task:
-        1. Determine if this is a document management request or an information retrieval request
-        2. Refine the query to be more specific and detailed if necessary
-        3. Suggest an appropriate search strategy and metadata filters if applicable
-        4. Identify the expected type of result (factual answer, summary, explanation, etc.)
-        """
-        
-        result = self.agent.run(prompt)
-        
-        # Convert result to QueryAnalysisResult
-        # Check if we're dealing with document management
-        is_document_management = any(keyword in query.lower() for keyword in 
-                                   ["process documents", "index documents", "add documents", 
-                                    "update knowledge base", "rebuild", "reindex"])
-        
-        # Simple refinement for demonstration
-        refined_query = query
-        if "?" not in query:
-            refined_query += "?"
-            
-        # Create analysis result
-        analysis = QueryAnalysisResult(
-            refined_query=refined_query,
-            search_strategy="semantic_search",
-            meta_filters=None,
-            is_document_management=is_document_management,
-            expected_result_type="factual" if "what" in query.lower() or "who" in query.lower() else "explanation"
-        )
-        
-        return analysis
     
-    def configure_response_settings(self, 
-                                   verbosity: Optional[ResponseFormat] = None,
-                                   include_citations: Optional[bool] = None,
-                                   include_sources_section: Optional[bool] = None,
-                                   max_length: Optional[int] = None,
-                                   format_markdown: Optional[bool] = None) -> ResponseSettings:
-        """
-        Configure response settings with custom parameters.
-        
-        Args:
-            verbosity: How detailed the response should be
-            include_citations: Whether to include source citations
-            include_sources_section: Whether to include a dedicated sources section
-            max_length: Maximum length of the response in characters
-            format_markdown: Whether to format the response using markdown
-            
-        Returns:
-            Updated response settings
-        """
-        # Start with default settings
-        settings = self.default_response_settings.copy()
-        
-        # Update with provided parameters
-        if verbosity is not None:
-            settings.verbosity = verbosity
-        if include_citations is not None:
-            settings.include_citations = include_citations
-        if include_sources_section is not None:
-            settings.include_sources_section = include_sources_section
-        if max_length is not None:
-            settings.max_length = max_length
-        if format_markdown is not None:
-            settings.format_markdown = format_markdown
-            
-        return settings
-    
-    def process_user_query(self, 
-                          query: str, 
-                          response_format: Optional[ResponseFormat] = None,
-                          include_citations: Optional[bool] = None,
-                          include_sources_section: Optional[bool] = None,
-                          max_length: Optional[int] = None) -> str:
-        """
-        Process a user query and return an appropriate response.
-        
-        Args:
-            query: User's query text
-            response_format: Verbosity level for the response
-            include_citations: Whether to include source citations
-            include_sources_section: Whether to include a dedicated sources section
-            max_length: Maximum length of the response in characters
-            
-        Returns:
-            Formatted response text
-        """
-        # Handle document processing command - check if this is a document processing request
-        processed_query = query.lower().strip()
-        if processed_query == "process documents" or (
-            "document" in processed_query and 
-            any(cmd in processed_query for cmd in ["process", "analyze", "index", "scan", "read", "parse"])
-        ):
-            return self.process_documents()
-        
-        # Configure response settings for this query
-        response_settings = self.configure_response_settings(
-            verbosity=response_format,
-            include_citations=include_citations,
-            include_sources_section=include_sources_section,
-            max_length=max_length
-        )
-        
-        # Log that we're processing a user query
-        logger.info(f"Processing user query: {query}")
-        
+    def process_query(self, query: str, response_format: Optional[ResponseFormat] = None) -> str:
+        """Process a user query through the complete RAG pipeline and return a response."""
         try:
-            # Analyze the query to refine it
-            analysis = self.analyze_query(query)
-            logger.debug(f"Query analysis complete: {analysis}")
+            # Handle special "process documents" command
+            if query.lower() == "process documents":
+                return self.process_documents()
+
+            # Set response settings based on provided format or default
+            response_settings = self.default_response_settings
+            if response_format:
+                response_settings.verbosity = response_format
+
+            logger.info(f"Processing query: '{query}'")
+
+            # Step 1: Analyze the query using query_analyzer_toolkit
+            logger.info(f"Analyzing query: '{query}'")
+            analysis_result = self.query_analyzer_toolkit.analyze_query(query)
             
-            # Define retrieval query
+            try:
+                import json
+                analysis_dict = json.loads(analysis_result)
+                refined_query = analysis_dict.get("refined_query", query)
+                meta_filters = analysis_dict.get("meta_filters", {})
+                expected_result_type = analysis_dict.get("expected_result_type", "factual")
+                
+                logger.info(f"Query analysis complete. Refined query: '{refined_query}'")
+                logger.info(f"Metadata filters: {meta_filters}")
+                logger.info(f"Expected result type: {expected_result_type}")
+            except Exception as e:
+                logger.error(f"Error parsing analysis result: {str(e)}", exc_info=True)
+                # Fall back to original query
+                refined_query = query
+                meta_filters = {}
+                expected_result_type = "factual"
+            
+            # Step 2: Retrieve information using the RetrieverAgent
+            logger.info(f"Retrieving information for refined query: '{refined_query}'")
+            
+            # Create the RetrievalQuery object with only the required fields
             retrieval_query = RetrievalQuery(
-                query=analysis.refined_query,
-                n_results=5,
-                metadata_filter=analysis.meta_filters
+                query=refined_query,
+                n_results=Config.MAX_RETRIEVAL_RESULTS,
+                metadata_filter=meta_filters,
+                search_type="hybrid",
+                expected_result_type=expected_result_type
+                #query_context=f"Original query: {query}"
             )
             
-            # Retrieve relevant information
+            # Use the RetrieverAgent to retrieve information
             retrieval_result = self.retriever.retrieve(retrieval_query)
-            logger.debug(f"Retrieval complete: success={retrieval_result.success}")
             
-            # Check if retrieval was successful and contains meaningful information
-            if not retrieval_result.success or not retrieval_result.context or retrieval_result.context.startswith("No information"):
-                return "I couldn't find any relevant information in the knowledge base to answer your query."
+            if not retrieval_result.success:
+                logger.warning(f"Retrieval failed: {retrieval_result.error_message}")
+                error_message = retrieval_result.error_message or "No information found"
+                if "string indices must be integers" in error_message:
+                    # This is a known error indicating a format mismatch
+                    error_message = "An internal format error occurred. Please try again."
+                
+                # Try a direct fallback search with simpler parameters
+                try:
+                    logger.info("Attempting fallback direct search")
+                    # Use the retriever's direct_query method which bypasses agent logic
+                    direct_results = self.retriever.direct_query(
+                        query_text=refined_query,
+                        n_results=Config.MAX_RETRIEVAL_RESULTS,
+                        metadata_filter=meta_filters,
+                        search_type="vector"  # Fall back to more reliable vector search
+                    )
+                    
+                    if direct_results and len(direct_results) > 0:
+                        # We got some results, format them into context
+                        logger.info(f"Fallback search successful, found {len(direct_results)} results")
+                        context = self._format_direct_results(direct_results, expected_result_type)
+                        
+                        # Generate response from context
+                        response_result = self.response_generator_toolkit.generate_response(
+                            context=context,
+                            query=query,
+                            expected_result_type=expected_result_type
+                        )
+                        
+                        if response_result.get("success", False):
+                            formatted_response = response_settings.format_response(response_result["response"])
+                            return formatted_response
+                    
+                    # If we reach here, the fallback didn't work either
+                    logger.warning("Fallback search returned no results")
+                except Exception as fallback_error:
+                    logger.error(f"Fallback search failed: {str(fallback_error)}", exc_info=True)
+                
+                # If all fails, return the error
+                return f"I couldn't find information related to your query. {error_message}"
+                
+            if not retrieval_result.context or retrieval_result.context.strip() == "":
+                logger.warning("Retrieval returned empty context")
+                return "I couldn't find specific information related to your query in our knowledge base."
             
-            # Create a direct instruction prompt for the RAG task 
-            # This is a comprehensive instruction rather than a dynamically constructed prompt
-            rag_prompt = f"""
-            Based on the following retrieved context from our knowledge base, please answer the user's query:
+            # Step 3: Generate a response using the response_generator_toolkit
+            logger.info("Generating response from retrieved information")
+            response_result = self.response_generator_toolkit.generate_response(
+                context=retrieval_result.context,
+                query=query,
+                expected_result_type=expected_result_type
+            )
             
-            USER QUERY: {query}
+            if not response_result.get("success", False):
+                logger.warning(f"Response generation failed: {response_result.get('error', 'Unknown error')}")
+                # Fallback to returning the context directly
+                formatted_response = response_settings.format_response(
+                    f"Here's what I found about your query:\n\n{retrieval_result.context}"
+                )
+                return formatted_response
             
-            RETRIEVED CONTEXT:
-            {retrieval_result.context}
-            
-            Follow these guidelines:
-            1. Only include information that is present in the retrieved context
-            2. Format your response according to the '{response_settings.verbosity}' verbosity level
-            3. Be direct and concise in your answer
-            4. If the information in the context is insufficient, acknowledge this limitation
-            """
-            
-            # Run the agent with this direct prompt
-            response = self.agent.run(rag_prompt)
-            
-            # Access the content using get_content_as_string() which properly handles all response types
-            return response.get_content_as_string()
-            
+            formatted_response = response_settings.format_response(response_result["response"])
+            return formatted_response
+
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
-            return f"Error processing your query: {str(e)}"
+            return f"I encountered an error while processing your query: {str(e)}"
 
+    def _format_direct_results(self, results: List[Dict[str, Any]], expected_result_type: str = "factual") -> str:
+        """Format direct results from vector store into context for response generation."""
+        sections = []
+        
+        for i, result in enumerate(results):
+            # Format the text content
+            content = result.get("text", "")
+            if not content:
+                continue
+                
+            # Format based on expected_result_type
+            if expected_result_type == "conceptual":
+                section = f"**Information {i+1}**\n\n{content}\n\n"
+            elif expected_result_type == "procedural":
+                section = f"**Procedure {i+1}**\n\n{content}\n\n"
+            elif expected_result_type == "opinion":
+                section = f"**Perspective {i+1}**\n\n{content}\n\n"
+            else:
+                section = f"**Document {i+1}**\n\n{content}\n\n"
+            
+            sections.append(section)
+            
+        if not sections:
+            return "No relevant information found."
+            
+        return "\n".join(sections)
+
+    def _get_focus_instruction(self, result_type: str) -> str:
+        """Helper to get appropriate focus instruction based on result type"""
+        if result_type == "factual":
+            return "accurate facts and specific details"
+        elif result_type == "procedural":
+            return "clear step-by-step instructions"
+        elif result_type == "conceptual":
+            return "thorough explanations of concepts"
+        elif result_type == "opinion":
+            return "balanced presentation of perspectives"
+        else:
+            return "relevant information"
+    
     @staticmethod
     def get_tools(response_settings: ResponseSettings):
-        """Get orchestration tools for the Agno agent."""
-        return [ResponseGeneratorToolkit(response_settings)] 
+        """Get tools for the Agno agent."""
+        return [QueryAnalyzerToolkit(), ResponseGeneratorToolkit(response_settings)]
+
+# For backward compatibility - kept for API compatibility
+process_user_query = OrchestratorAgent.process_query 

@@ -1,55 +1,67 @@
-# Advanced Multi-Agent RAG System
+# RAG System
 
-This project implements an advanced Retrieval Augmented Generation (RAG) system using multiple agents built with the Agno framework.
+A retrieval-augmented generation (RAG) system that provides improved question answering capabilities by leveraging your documents.
 
-## System Architecture
+## Configuration
 
-The system contains three specialized agents:
+The system is configured through a `.env` file. You can create one by copying the provided example:
 
-1. **Orchestrator Agent**:
-   - Processes user input and distributes tasks to other agents
-   - Reformulates vague queries into clear instructions
-   - Formats information retrieved from the knowledge base for user consumption
+```bash
+cp .env.example .env
+```
 
-2. **Document Processor Agent**:
-   - Processes PDF documents from a local folder
-   - Extracts text and metadata from documents
-   - Builds and maintains a knowledge base using ChromaDB
+Then edit the `.env` file to set your configuration:
 
-3. **Retriever Agent**:
-   - Takes query instructions from the Orchestrator Agent
-   - Searches the ChromaDB vector database for relevant content
-   - Returns contextually appropriate results
+### Configuration Options
 
-## Setup and Installation
+#### API Keys
+- `OPENAI_API_KEY`: Your OpenAI API key (required)
+- `COHERE_API_KEY`: Your Cohere API key (required for reranking)
+- `LLAMA_CLOUD_API_KEY`: Your Llama Cloud API key (optional)
 
-1. Install required dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
+#### Vector Store Configuration
+- `PERSISTENCE_DIRECTORY`: Directory for vector database storage (default: `./data/vector_db`)
+- `COLLECTION_NAME`: Name of the vector collection (default: `documents`)
+- `EMBEDDING_MODEL_ID`: Model ID for embeddings (default: `text-embedding-ada-002`)
+- `SEARCH_TYPE`: Type of search to perform (default: `hybrid`)
+- `BATCH_SIZE`: Batch size for document processing (default: `5`)
 
-2. Set up environment variables:
-   - Create a `.env` file with your OpenAI API key:
-   ```
-   OPENAI_API_KEY=your_openai_api_key
-   ```
+#### Document Processing Configuration
+- `DOCUMENTS_DIR`: Directory containing documents to process (default: `./data/documents`)
+- `CHUNKING_STRATEGY`: Strategy for chunking documents (default: `semantic`)
+- `CHUNK_SIZE`: Maximum chunk size in tokens (default: `500`)
+- `CHUNK_OVERLAP`: Overlap between chunks in tokens (default: `50`)
 
-3. Add your PDF documents to the `data/documents/` directory.
+#### Response Settings
+- `RESPONSE_FORMAT`: Format of the response (default: `balanced`)
+- `MAX_RESPONSE_LENGTH`: Maximum length of the response (default: `1000`)
+- `MAX_RESULTS`: Maximum number of results to return (default: `5`)
+- `FORMAT_MARKDOWN`: Whether to format responses using markdown (default: `true`)
 
-4. Run the system:
-   ```
-   python src/main.py
-   ```
+#### AI Model Configuration
+- `MODEL_ID`: ID of the model to use (default: `gpt-3.5-turbo`)
+- `USE_RERANKING`: Whether to use reranking (default: `true`)
+
+#### Logging Configuration
+- `LOG_LEVEL`: Logging level (default: `INFO`, options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`)
+- `LOG_TO_FILE`: Whether to log to a file (default: `false`)
+- `LOG_FILE_PATH`: Path to the log file (default: `./logs/app.log`)
+- `ENABLE_DETAILED_LOGGING`: Whether to use detailed logging format (default: `false`)
+- `ENABLE_CONSOLE_LOGGING`: Whether to display logs in the console/terminal (default: `true`, set to `false` to disable all terminal logging)
+
+## Running the System
+
+1. Place your documents in the `DOCUMENTS_DIR` directory (default: `./data/documents`)
+2. Run the system:
+
+```bash
+python src/main.py
+```
 
 ## Usage
 
-Once running, interact with the system by typing your queries. The Orchestrator Agent will:
-- Process your query
-- Direct the appropriate agents to retrieve information
-- Return formatted, contextually relevant responses
+Once the system is running, you can:
+1. Ask questions about your documents
+2. Type 'exit' or 'quit' to end the session
 
-## Requirements
-
-- Python 3.9+
-- OpenAI API key
-- Sufficient PDF documents for knowledge base creation 
+The system will analyze your documents and provide answers to your questions based on the content of those documents. 

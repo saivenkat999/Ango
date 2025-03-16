@@ -1,6 +1,12 @@
 agno>=1.1.0
 openai>=1.0.0
-chromadb>=0.4.18
-pypdf>=3.15.1
+lancedb>=0.4.0
+llama-cloud-services>=0.1.0
+llama-index-core>=0.10.0
+llama-index-readers-file>=0.1.0
+pyarrow>=14.0.1
 python-dotenv>=1.0.0
-pydantic>=2.0.0 
+pydantic>=2.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+tantivy-py>=0.11.0 
