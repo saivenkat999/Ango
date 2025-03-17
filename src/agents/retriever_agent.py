@@ -1,5 +1,5 @@
 import logging
-from typing import List, Dict, Any, Optional, Tuple, Union
+from typing import List, Dict, Any, Optional, Tuple, Union, Set
 from agno.agent import Agent
 from agno.models.openai import OpenAIChat
 from agno.tools import Toolkit
@@ -36,6 +36,103 @@ class RetrievalResult(BaseModel):
     context: Optional[str] = Field(None, description="Formatted context from the results")
     error_message: Optional[str] = Field(None, description="Error message if retrieval failed")
 
+class KeywordExtractor:
+    """
+    Utility for extracting document-specific keywords from queries.
+    
+    This class maintains mappings of keywords to document types and
+    helps identify which document is being referred to in a query.
+    """
+    
+    def __init__(self):
+        """Initialize keyword mappings for different document types."""
+        # Technology-specific keywords
+        self.tech_keywords = {
+            "odbc": {"odbc", "open database connectivity", "dsn", "data source name", "driver manager"},
+            "jdbc": {"jdbc", "java database", "connection pool", "java", "j2ee", "connection url"},
+            "ado": {"ado", "ado.net", ".net", "c#", "vb.net", "connection string", "connection properties"},
+        }
+        
+        # Database-specific keywords
+        self.db_keywords = {
+            "redshift": {"redshift", "amazon redshift", "aws", "columnar", "mpp", "massively parallel"},
+            "oracle": {"oracle", "pl/sql", "tns", "tnsnames", "tablespace", "oracle database"},
+            "sqlserver": {"sql server", "microsoft sql", "t-sql", "tsql", "mssql", "windows authentication"},
+            "postgres": {"postgres", "postgresql", "psql", "pg"},
+            "mysql": {"mysql", "my.cnf", "innodb", "myisam"},
+        }
+        
+        # Feature-specific keywords
+        self.feature_keywords = {
+            "encryption": {"encrypt", "encryption", "ssl", "tls", "secure", "security", "certificate"},
+            "authentication": {"auth", "authentication", "login", "credential", "password", "username", "sso"},
+            "performance": {"performance", "tuning", "optimize", "cache", "connection pool", "pooling"},
+            "troubleshooting": {"error", "troubleshoot", "debug", "issue", "problem", "failure", "diagnostic"},
+        }
+
+    def extract_keywords(self, query: str) -> Dict[str, Set[str]]:
+        """
+        Extract keywords from the query that match known document types.
+        
+        Args:
+            query: The query string to analyze
+            
+        Returns:
+            Dictionary with categories as keys and sets of matched keywords as values
+        """
+        query = query.lower()
+        results = {
+            "technology": set(),
+            "database": set(),
+            "feature": set()
+        }
+        
+        # Check for technology keywords
+        for tech, keywords in self.tech_keywords.items():
+            if any(kw in query for kw in keywords):
+                results["technology"].add(tech)
+                
+        # Check for database keywords
+        for db, keywords in self.db_keywords.items():
+            if any(kw in query for kw in keywords):
+                results["database"].add(db)
+                
+        # Check for feature keywords
+        for feature, keywords in self.feature_keywords.items():
+            if any(kw in query for kw in keywords):
+                results["feature"].add(feature)
+                
+        return results
+    
+    def enhance_metadata_filter(self, query: str, metadata_filter: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Enhance metadata filter with extracted keywords from the query.
+        
+        Args:
+            query: The query string to analyze
+            metadata_filter: Existing metadata filter to enhance
+            
+        Returns:
+            Enhanced metadata filter
+        """
+        # Make a copy to avoid modifying the original filter
+        enhanced_filter = metadata_filter.copy() if metadata_filter else {}
+        
+        # Extract keywords from query
+        extracted = self.extract_keywords(query)
+        
+        # Enhance filter with extracted keywords
+        for category, values in extracted.items():
+            if values:
+                # If only one value is found, add it directly
+                if len(values) == 1:
+                    enhanced_filter[category] = next(iter(values))
+                # Otherwise, add as a list
+                elif len(values) > 1:
+                    enhanced_filter[category] = list(values)
+                    
+        return enhanced_filter
+
 class InfoRetrievalToolkit(Toolkit):
     """
     Toolkit for retrieving information from the knowledge base using advanced search techniques.
@@ -54,6 +151,9 @@ class InfoRetrievalToolkit(Toolkit):
     def __init__(self, vector_store: VectorStore, cohere_api_key: str = None):
         super().__init__(name="information_retrieval")
         self.vector_store = vector_store
+
+        # Initialize the keyword extractor
+        self.keyword_extractor = KeywordExtractor()
 
         # Initialize the CohereReranker with API key if provided
         self.reranker = CohereReranker(
@@ -98,20 +198,32 @@ class InfoRetrievalToolkit(Toolkit):
             ))
         """
         try:
+            # Extract query text and other parameters
+            query_text = retrieval_query.query
+            metadata_filter = retrieval_query.metadata_filter or {}
+            
+            # Enhance metadata filters with keyword extraction
+            enhanced_filter = self.keyword_extractor.enhance_metadata_filter(query_text, metadata_filter)
+            
+            # Log the metadata filter updates
+            if enhanced_filter != metadata_filter:
+                logger.info(f"Enhanced metadata filters from: {metadata_filter} to: {enhanced_filter}")
+                metadata_filter = enhanced_filter
+            
             # Log the retrieval request
-            logger.info(f"Retrieving information for query: '{retrieval_query.query}', n_results={retrieval_query.n_results}, filters={retrieval_query.metadata_filter}")
+            logger.info(f"Retrieving information for query: '{query_text}', n_results={retrieval_query.n_results}, filters={metadata_filter}")
 
             # The VectorStore returns a list of document dictionaries
             document_results = self.vector_store.query(
-                query_text=retrieval_query.query,
+                query_text=query_text,
                 n_results=retrieval_query.n_results,
-                metadata_filter=retrieval_query.metadata_filter,
+                metadata_filter=metadata_filter,
                 search_type=retrieval_query.search_type,
             )
 
             # Check if we have any results
             if not document_results or len(document_results) == 0:
-                logger.warning(f"No results found for query: {retrieval_query.query}")
+                logger.warning(f"No results found for query: {query_text}")
                 return "No information related to your query was found in the knowledge base.", []
 
             # Defensive validation of document_results to ensure proper format
@@ -138,7 +250,7 @@ class InfoRetrievalToolkit(Toolkit):
 
             # If validation removed all results
             if not validated_results:
-                logger.warning(f"No valid results remained after validation for query: {retrieval_query.query}")
+                logger.warning(f"No valid results remained after validation for query: {query_text}")
                 return "No valid information related to your query was found in the knowledge base.", []
                 
             document_results = validated_results
@@ -160,7 +272,7 @@ class InfoRetrievalToolkit(Toolkit):
 
             try:
                 # Use CohereReranker to rerank documents - this works directly with Agno Documents
-                reranked_documents = self.reranker.rerank(query=retrieval_query.query, documents=agno_documents)
+                reranked_documents = self.reranker.rerank(query=query_text, documents=agno_documents)
 
                 # Check if we received valid results from reranking
                 if reranked_documents and len(reranked_documents) > 0:
@@ -192,7 +304,7 @@ class InfoRetrievalToolkit(Toolkit):
             formatted_context = self._format_context(structured_results, retrieval_query.expected_result_type)
 
             # Log success
-            logger.info(f"Successfully retrieved {len(structured_results)} results for query: '{retrieval_query.query}'")
+            logger.info(f"Successfully retrieved {len(structured_results)} results for query: '{query_text}'")
 
             # Return both the formatted context and the document results
             return formatted_context, structured_results

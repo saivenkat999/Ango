@@ -448,35 +448,61 @@ class VectorStore:
                 
                 # If no exact matches, try partial matching
                 if not filtered_results:
-                    logger.debug("No exact metadata matches found, trying partial matching")
+                    logger.debug("No exact metadata matches found, trying fuzzy matching")
                     for _, row in original_results.iterrows():
                         try:
                             row_metadata = json.loads(row['metadata'])
                             match_score = 0
+                            total_fields = len(metadata_filter)
                             
-                            # Score each metadata field match
+                            # Score each metadata field match with improved matching algorithm
                             for key, value in metadata_filter.items():
                                 if key in row_metadata:
-                                    # For string values, check for substring match
+                                    # For string values, check for fuzzy match using similarity ratio
                                     if isinstance(row_metadata[key], str) and isinstance(value, str):
+                                        # Simple fuzzy matching - can be improved with proper string similarity libraries
                                         if value.lower() in row_metadata[key].lower() or row_metadata[key].lower() in value.lower():
-                                            match_score += 1
-                                    # For list values, check for any overlap
+                                            # Give more weight to exact matches
+                                            if value.lower() == row_metadata[key].lower():
+                                                match_score += 1.0
+                                            else:
+                                                # Partial match - the longer the common part, the higher the score
+                                                common_length = min(len(value), len(row_metadata[key]))
+                                                match_score += 0.5 + (0.5 * len(value) / common_length)
+                                    # For list values, check for any overlap with improved scoring
                                     elif isinstance(row_metadata[key], list) and isinstance(value, (str, list, tuple)):
+                                        matches_found = 0
                                         if isinstance(value, (list, tuple)):
-                                            if any(v.lower() in str(item).lower() for v in value for item in row_metadata[key]):
-                                                match_score += 1
+                                            for v in value:
+                                                for item in row_metadata[key]:
+                                                    if isinstance(item, str) and isinstance(v, str):
+                                                        if v.lower() in item.lower() or item.lower() in v.lower():
+                                                            matches_found += 1
+                                                            # Bonus for exact match
+                                                            if v.lower() == item.lower():
+                                                                matches_found += 0.5
                                         else:  # value is string
-                                            if any(value.lower() in str(item).lower() for item in row_metadata[key]):
-                                                match_score += 1
+                                            for item in row_metadata[key]:
+                                                if isinstance(item, str) and value.lower() in item.lower():
+                                                    matches_found += 1
+                                                    # Bonus for exact match
+                                                    if value.lower() == item.lower():
+                                                        matches_found += 0.5
+                                        
+                                        if matches_found > 0:
+                                            # Normalize score based on number of matches found and total items
+                                            match_score += min(1.0, matches_found / len(row_metadata[key]) if row_metadata[key] else 0)
                                     # For exact matches
                                     elif row_metadata[key] == value:
-                                        match_score += 1
+                                        match_score += 1.0
                             
-                            # If at least one metadata field matches
-                            if match_score > 0:
-                                row['match_score'] = match_score
-                                filtered_results.append(row)
+                            # Normalize match score by total fields in filter
+                            if total_fields > 0:
+                                normalized_score = match_score / total_fields
+                                # Only consider matches above a certain threshold (50%)
+                                if normalized_score >= 0.5:
+                                    row['match_score'] = normalized_score
+                                    filtered_results.append(row)
                         except json.JSONDecodeError:
                             continue
                     

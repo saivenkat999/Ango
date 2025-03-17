@@ -3,48 +3,7 @@
     "docstore_compression": "lz4",
     "docstore_blocksize": 16384
   },
-  "segments": [
-    {
-      "segment_id": "c4207c00-e1e7-4e7a-92d5-2a2632e01e18",
-      "max_doc": 413,
-      "deletes": null
-    },
-    {
-      "segment_id": "663a651e-35d0-41c7-8aaf-88786a70e56f",
-      "max_doc": 268,
-      "deletes": null
-    },
-    {
-      "segment_id": "bb95487f-b3aa-4b21-9e7a-d6633b808910",
-      "max_doc": 63,
-      "deletes": null
-    },
-    {
-      "segment_id": "f930a39a-8cf5-46bf-805c-be0abac2dc7c",
-      "max_doc": 1,
-      "deletes": null
-    },
-    {
-      "segment_id": "baaea79e-8de9-4568-b63b-dad3240d5d40",
-      "max_doc": 1,
-      "deletes": null
-    },
-    {
-      "segment_id": "7f7c580b-4cfb-45f2-9689-ea95b00c8e21",
-      "max_doc": 1,
-      "deletes": null
-    },
-    {
-      "segment_id": "4369c908-7d84-4628-8e7b-eb4fe3132018",
-      "max_doc": 1,
-      "deletes": null
-    },
-    {
-      "segment_id": "d4729065-3b1a-454b-a32e-36250e27bb37",
-      "max_doc": 1,
-      "deletes": null
-    }
-  ],
+  "segments": [],
   "schema": [
     {
       "name": "doc_id",
@@ -70,5 +29,5 @@
       }
     }
   ],
-  "opstamp": 757
+  "opstamp": 0
 }

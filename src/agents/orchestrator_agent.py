@@ -268,12 +268,14 @@ class QueryAnalyzerToolkit(Toolkit):
             1. Refine the query for optimal retrieval
             2. Identify any metadata filters that should be applied
             3. Identify the expected result type (factual, conceptual, procedural, opinion)
+            4. Identify the document type or subject domain the query is about
 
             Respond with a JSON object containing:
             {{
             "refined_query": "Your refined query here",
             "meta_filters": {{"key1": "value1", "key2": "value2"}},
-            "expected_result_type": "factual|conceptual|procedural|opinion"
+            "expected_result_type": "factual|conceptual|procedural|opinion",
+            "document_type": "The document type or subject domain this query is about"
             }}
             """
 
@@ -309,8 +311,28 @@ class QueryAnalyzerToolkit(Toolkit):
                 result = {
                     "refined_query": analysis_dict.get("refined_query", query),
                     "meta_filters": analysis_dict.get("meta_filters", {}),
-                    "expected_result_type": analysis_dict.get("expected_result_type", "factual")
+                    "expected_result_type": analysis_dict.get("expected_result_type", "factual"),
+                    "document_type": analysis_dict.get("document_type", "unknown")
                 }
+                
+                # Enhance metadata filters based on detected document type
+                doc_type = result.get("document_type", "").lower()
+                meta_filters = result.get("meta_filters", {})
+                
+                # If document type is detected, add it to metadata filters
+                if doc_type and doc_type != "unknown":
+                    meta_filters["document_type"] = doc_type
+                
+                # Detect specific product or technology
+                if "odbc" in query.lower() or "odbc" in doc_type:
+                    meta_filters["technology"] = "odbc"
+                elif "jdbc" in query.lower() or "jdbc" in doc_type:
+                    meta_filters["technology"] = "jdbc"
+                elif "redshift" in query.lower() or "redshift" in doc_type:
+                    meta_filters["database"] = "redshift"
+                
+                # Update metadata filters in result
+                result["meta_filters"] = meta_filters
                 
                 return json.dumps(result)
 
@@ -341,8 +363,28 @@ class QueryAnalyzerToolkit(Toolkit):
             result = {
                 "refined_query": query,
                 "meta_filters": meta_filters,
-                "expected_result_type": expected_result_type
+                "expected_result_type": expected_result_type,
+                "document_type": "unknown"
             }
+            
+            # Enhance metadata filters based on detected document type
+            doc_type = result.get("document_type", "").lower()
+            meta_filters = result.get("meta_filters", {})
+            
+            # If document type is detected, add it to metadata filters
+            if doc_type and doc_type != "unknown":
+                meta_filters["document_type"] = doc_type
+            
+            # Detect specific product or technology
+            if "odbc" in query.lower() or "odbc" in doc_type:
+                meta_filters["technology"] = "odbc"
+            elif "jdbc" in query.lower() or "jdbc" in doc_type:
+                meta_filters["technology"] = "jdbc"
+            elif "redshift" in query.lower() or "redshift" in doc_type:
+                meta_filters["database"] = "redshift"
+            
+            # Update metadata filters in result
+            result["meta_filters"] = meta_filters
             
             return json.dumps(result)
 
@@ -352,7 +394,8 @@ class QueryAnalyzerToolkit(Toolkit):
             return json.dumps({
                 "refined_query": query,
                 "meta_filters": {},
-                "expected_result_type": "factual"
+                "expected_result_type": "factual",
+                "document_type": "unknown"
             })
 
 class OrchestratorAgent:
@@ -416,6 +459,14 @@ class OrchestratorAgent:
         # Create toolkits
         self.query_analyzer_toolkit = QueryAnalyzerToolkit(model=self.model)
         self.response_generator_toolkit = ResponseGeneratorToolkit(self.default_response_settings, model=self.model)
+        
+        # Initialize conversation context tracking
+        self.conversation_context = {
+            "current_document_focus": None,  # Currently focused document
+            "recent_metadata_filters": [],   # Recent metadata filters used
+            "recent_topics": [],             # Recent topics discussed
+            "query_history": []              # History of previous queries
+        }
         
         # Initialize the agent with specialized instructions
         self.agent = Agent(
@@ -517,6 +568,12 @@ class OrchestratorAgent:
             if query.lower() == "process documents":
                 return self.process_documents()
 
+            # Track query in history
+            self.conversation_context["query_history"].append(query)
+            if len(self.conversation_context["query_history"]) > 10:
+                # Keep only the last 10 queries
+                self.conversation_context["query_history"] = self.conversation_context["query_history"][-10:]
+
             # Set response settings based on provided format or default
             response_settings = self.default_response_settings
             if response_format:
@@ -526,7 +583,18 @@ class OrchestratorAgent:
 
             # Step 1: Analyze the query using query_analyzer_toolkit
             logger.info(f"Analyzing query: '{query}'")
-            analysis_result = self.query_analyzer_toolkit.analyze_query(query)
+            
+            # Enhance the query analysis with conversation context
+            enhanced_query = query
+            # If there's a focus on a specific document, add context
+            if self.conversation_context.get("current_document_focus"):
+                doc_focus = self.conversation_context["current_document_focus"]
+                # Only add context if it's not already in the query
+                if doc_focus.lower() not in query.lower():
+                    enhanced_query = f"{query} [Context: Referring to {doc_focus}]"
+                    logger.info(f"Enhanced query with document context: '{enhanced_query}'")
+            
+            analysis_result = self.query_analyzer_toolkit.analyze_query(enhanced_query)
             
             try:
                 import json
@@ -534,16 +602,42 @@ class OrchestratorAgent:
                 refined_query = analysis_dict.get("refined_query", query)
                 meta_filters = analysis_dict.get("meta_filters", {})
                 expected_result_type = analysis_dict.get("expected_result_type", "factual")
+                document_type = analysis_dict.get("document_type", "unknown")
+                
+                # Update conversation context with detected document type
+                if document_type and document_type != "unknown":
+                    self.conversation_context["current_document_focus"] = document_type
+                    logger.info(f"Updated document focus to: {document_type}")
+                
+                # Store metadata filters in context for future reference
+                if meta_filters:
+                    self.conversation_context["recent_metadata_filters"].append(meta_filters)
+                    # Keep only the last 5 filters
+                    if len(self.conversation_context["recent_metadata_filters"]) > 5:
+                        self.conversation_context["recent_metadata_filters"] = self.conversation_context["recent_metadata_filters"][-5:]
+                
+                # Check for follow-up questions
+                is_followup = self._is_followup_question(query)
+                if is_followup and self.conversation_context["recent_metadata_filters"]:
+                    # Enhance metadata filters with previous context
+                    prev_filters = self.conversation_context["recent_metadata_filters"][-1]
+                    logger.info(f"Detected follow-up question, enhancing with previous filters: {prev_filters}")
+                    # Only add previous filters if they don't conflict with current ones
+                    for key, value in prev_filters.items():
+                        if key not in meta_filters:
+                            meta_filters[key] = value
                 
                 logger.info(f"Query analysis complete. Refined query: '{refined_query}'")
                 logger.info(f"Metadata filters: {meta_filters}")
                 logger.info(f"Expected result type: {expected_result_type}")
+                logger.info(f"Document type: {document_type}")
             except Exception as e:
                 logger.error(f"Error parsing analysis result: {str(e)}", exc_info=True)
                 # Fall back to original query
                 refined_query = query
                 meta_filters = {}
                 expected_result_type = "factual"
+                document_type = "unknown"
             
             # Step 2: Retrieve information using the RetrieverAgent
             logger.info(f"Retrieving information for refined query: '{refined_query}'")
@@ -674,6 +768,46 @@ class OrchestratorAgent:
     def get_tools(response_settings: ResponseSettings):
         """Get tools for the Agno agent."""
         return [QueryAnalyzerToolkit(), ResponseGeneratorToolkit(response_settings)]
+
+    def _is_followup_question(self, query: str) -> bool:
+        """
+        Determine if the query is a follow-up question based on linguistic patterns.
+        
+        Args:
+            query: The user query text
+            
+        Returns:
+            True if the query appears to be a follow-up question, False otherwise
+        """
+        # Follow-up patterns
+        followup_patterns = [
+            r'^(what|how|why|when|where|who|which) (about|if|is|are|does|do|can|could|would|will|has|have)',  # What about, How is, etc.
+            r'^(and|also|additionally|besides|furthermore|moreover)',  # Starting with conjunctions
+            r'^(can|could|would|will) (you|it|they|we)',  # Can you, Would it, etc.
+            r'\b(it|this|that|these|those|they)\b',  # Pronouns without clear referents
+            r'^(tell me more|explain further|elaborate|continue|go on)',  # Explicit continuation requests
+        ]
+        
+        query_lower = query.lower().strip()
+        
+        import re
+        # Check for follow-up patterns
+        for pattern in followup_patterns:
+            if re.search(pattern, query_lower):
+                return True
+                
+        # Check if query is very short (likely a follow-up)
+        if len(query_lower.split()) <= 3:
+            return True
+            
+        # Check if query has no interrogative word or verb (incomplete question)
+        has_question_element = any(word in query_lower for word in 
+                                 ['what', 'how', 'why', 'when', 'where', 'who', 'which', 
+                                  'show', 'tell', 'explain', 'describe'])
+        if not has_question_element:
+            return True
+            
+        return False
 
 # For backward compatibility - kept for API compatibility
 process_user_query = OrchestratorAgent.process_query 
