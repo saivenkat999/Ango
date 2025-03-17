@@ -4,13 +4,9 @@ from agno.agent import Agent
 from agno.models.openai import OpenAIChat
 from agno.tools import Toolkit
 from pydantic import BaseModel, Field
-from agno.document import Document as AgnoDocument
 from ..utils.config import Config
 
 from ..utils.vector_store import VectorStore
-
-# Import proper reranking functionality
-from agno.reranker.cohere import CohereReranker
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -148,19 +144,17 @@ class InfoRetrievalToolkit(Toolkit):
     based on a user query.
     """
 
-    def __init__(self, vector_store: VectorStore, cohere_api_key: str = None):
+    def __init__(self, vector_store: VectorStore):
         super().__init__(name="information_retrieval")
         self.vector_store = vector_store
 
         # Initialize the keyword extractor
         self.keyword_extractor = KeywordExtractor()
 
-        # Initialize the CohereReranker with API key if provided
-        self.reranker = CohereReranker(
-            top_n=None,  # We'll handle top_n manually
-            api_key=cohere_api_key,
-            model="rerank-multilingual-v3.0"  # Using the latest model
-        )
+        # We no longer need to initialize our own reranker,
+        # since we'll use the one from the vector_store
+        # which is already configured according to Config.RERANKER_TYPE
+        logger.info(f"Using reranker from VectorStore ({Config.RERANKER_TYPE})")
 
         # Register the retrieve_information function
         self.register(self.retrieve_information)
@@ -256,58 +250,28 @@ class InfoRetrievalToolkit(Toolkit):
             document_results = validated_results
             logger.debug(f"Validated {len(document_results)} document results")
             
-            # Convert dictionary results to Agno documents for processing
-            agno_documents = []
-            for doc_dict in document_results:
-                try:
-                    agno_doc = AgnoDocument(
-                        content=doc_dict['text'],
-                        meta_data=doc_dict['metadata'],
-                        name=doc_dict.get('id', f"doc_{len(agno_documents)}")
-                    )
-                    agno_documents.append(agno_doc)
-                except Exception as e:
-                    logger.warning(f"Error converting document to AgnoDocument: {str(e)}")
-                    continue
-
-            try:
-                # Use CohereReranker to rerank documents - this works directly with Agno Documents
-                reranked_documents = self.reranker.rerank(query=query_text, documents=agno_documents)
-
-                # Check if we received valid results from reranking
-                if reranked_documents and len(reranked_documents) > 0:
-                    # Limit to requested number of results
-                    reranked_documents = reranked_documents[:retrieval_query.n_results]
-                    logger.info(f"Successfully reranked documents, highest score: {reranked_documents[0].reranking_score if reranked_documents else 'N/A'}")
-                    # Use these for formatted results
-                    final_documents = reranked_documents
-                else:
-                    logger.warning("Reranker returned no documents, falling back to original results")
-                    final_documents = agno_documents[:retrieval_query.n_results]
-
-            except Exception as e:
-                logger.error(f"Error during reranking: {str(e)}, proceeding with hybrid search results", exc_info=True)
-                # If reranking fails, still return the vector search results
-                final_documents = agno_documents[:retrieval_query.n_results]
-
-            # Convert Agno Documents to format expected by _format_context
-            structured_results = []
-            for doc in final_documents:
-                result = {
-                    "id": doc.name or doc.id if hasattr(doc, 'id') else "unknown",
-                    "text": doc.content,
-                    "metadata": doc.meta_data
-                }
-                structured_results.append(result)
-
+            # Rerank documents using vector_store if needed
+            if Config.USE_RERANKING:
+                # Use the VectorStore's dedicated reranking method
+                reranked_results = self.vector_store.rerank_documents(
+                    query_text=query_text,
+                    documents=document_results,
+                    n_results=retrieval_query.n_results
+                )
+                
+                # If reranking was successful, use the reranked results
+                if reranked_results:
+                    document_results = reranked_results
+                    logger.info(f"Documents reranked using VectorStore's {Config.RERANKER_TYPE} reranker")
+            
             # Format the context
-            formatted_context = self._format_context(structured_results, retrieval_query.expected_result_type)
+            formatted_context = self._format_context(document_results, retrieval_query.expected_result_type)
 
             # Log success
-            logger.info(f"Successfully retrieved {len(structured_results)} results for query: '{query_text}'")
+            logger.info(f"Successfully retrieved {len(document_results)} results for query: '{query_text}'")
 
             # Return both the formatted context and the document results
-            return formatted_context, structured_results
+            return formatted_context, document_results
 
         except Exception as e:
             logger.error(f"Error retrieving information: {str(e)}", exc_info=True)
@@ -462,15 +426,13 @@ class RetrieverAgent:
 
     def __init__(self,
                  model_id: str = Config.MODEL_ID,
-                 vector_store: VectorStore = None,
-                 cohere_api_key: Optional[str] = None):
+                 vector_store: VectorStore = None):
         """
         Initialize the Retriever Agent.
 
         Args:
             model_id: ID of the OpenAI model to use
             vector_store: Vector store for querying documents
-            cohere_api_key: API key for Cohere reranking (optional)
         """
         # Set up agent config
         self.model_id = model_id
@@ -480,8 +442,7 @@ class RetrieverAgent:
 
         # Create abilities for the agent
         self.info_retrieval_toolkit = InfoRetrievalToolkit(
-            vector_store=vector_store,
-            cohere_api_key=cohere_api_key
+            vector_store=vector_store
         )
 
         # Initialize the agent with specialized instructions

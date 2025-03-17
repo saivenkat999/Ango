@@ -71,9 +71,33 @@ class VectorStore:
             self.embedding_dim = len(test_embedding)
             logger.info(f"Embedding dimension: {self.embedding_dim}")
             
-            # Initialize the reranker for hybrid search
-            self.reranker = LinearCombinationReranker(weight=0.7)
-            logger.info("Initialized LinearCombinationReranker for hybrid search")
+            # Initialize the reranker for hybrid search based on configuration
+            reranker_type = Config.RERANKER_TYPE.lower()
+            if reranker_type == "linear":
+                from lancedb.rerankers import LinearCombinationReranker
+                self.reranker = LinearCombinationReranker(weight=Config.RERANKER_WEIGHT)
+                logger.info(f"Initialized LinearCombinationReranker with weight {Config.RERANKER_WEIGHT}")
+            elif reranker_type == "cohere":
+                try:
+                    from lancedb.rerankers import CohereReranker
+                    self.reranker = CohereReranker(
+                        model_name=Config.RERANKER_MODEL,
+                        api_key=Config.COHERE_API_KEY
+                    )
+                    logger.info(f"Initialized CohereReranker with model {Config.RERANKER_MODEL}")
+                except ImportError:
+                    logger.warning("Cohere reranker not available. Falling back to LinearCombinationReranker")
+                    from lancedb.rerankers import LinearCombinationReranker
+                    self.reranker = LinearCombinationReranker(weight=Config.RERANKER_WEIGHT)
+            elif reranker_type == "rrf":
+                from lancedb.rerankers import RRFReranker
+                self.reranker = RRFReranker()
+                logger.info("Initialized RRFReranker (Reciprocal Rank Fusion)")
+            else:
+                # Default fallback
+                from lancedb.rerankers import LinearCombinationReranker
+                self.reranker = LinearCombinationReranker(weight=0.7)
+                logger.info(f"Unknown reranker type '{reranker_type}', using LinearCombinationReranker")
             
             # Initialize cache for embeddings
             self._embedding_cache = {}
@@ -296,13 +320,11 @@ class VectorStore:
                 query_embedding = self._embed_text(query_text)
                 logger.debug(f"Using hybrid search with query: {query_text}")
                 try:
-                    # First, try using the built-in hybrid search
+                    # First, try using the built-in hybrid search with proper vector and text queries
                     hybrid_search = self.table.search(
-                        query=query_text,
-                        vector_column_name="vector",
-                        query_type="hybrid",
-                        fts_columns=["text"]
-                    )
+                        query_type="hybrid"
+                    ).vector(query_embedding).text(query_text)
+                    
                     # Apply the reranker with the correct method signature
                     search_query = hybrid_search.rerank(self.reranker)
                     results = search_query.limit(n_results * 3).to_pandas()  # Get more results for filtering
@@ -417,103 +439,45 @@ class VectorStore:
                 original_results = results.copy()
                 filtered_results = []
                 
-                # First pass: try to find exact matches
+                # First pass: try to find exact matches with relaxed filtering
                 for _, row in results.iterrows():
                     try:
                         row_metadata = json.loads(row['metadata'])
                         match = True
+                        match_score = 0
                         
-                        # Check if all filter conditions match
+                        # Check if any filter conditions match (relaxed matching)
                         for key, value in metadata_filter.items():
-                            if key not in row_metadata:
-                                match = False
-                                break
-                                
-                            if isinstance(value, (list, tuple)):
-                                # For lists, check if any value matches
-                                if row_metadata[key] not in value:
-                                    match = False
-                                    break
-                            else:
-                                # For single values, check exact match
-                                if row_metadata[key] != value:
-                                    match = False
-                                    break
+                            if key in row_metadata:
+                                # For string values, check for partial match
+                                if isinstance(row_metadata[key], str) and isinstance(value, str):
+                                    if value.lower() in row_metadata[key].lower():
+                                        match_score += 1
+                                # For list values, check for any overlap
+                                elif isinstance(row_metadata[key], list) and isinstance(value, (str, list, tuple)):
+                                    if isinstance(value, (list, tuple)):
+                                        if any(v.lower() in str(item).lower() for v in value for item in row_metadata[key]):
+                                            match_score += 1
+                                    else:
+                                        if any(value.lower() in str(item).lower() for item in row_metadata[key]):
+                                            match_score += 1
+                                # For exact matches
+                                elif row_metadata[key] == value:
+                                    match_score += 1
                         
-                        if match:
+                        # Consider a match if at least one filter condition matches
+                        if match_score > 0:
+                            row['match_score'] = match_score / len(metadata_filter)
                             filtered_results.append(row)
                     except json.JSONDecodeError:
                         logger.warning(f"Invalid JSON in metadata: {row['metadata']}")
                         continue
                 
-                # If no exact matches, try partial matching
-                if not filtered_results:
-                    logger.debug("No exact metadata matches found, trying fuzzy matching")
-                    for _, row in original_results.iterrows():
-                        try:
-                            row_metadata = json.loads(row['metadata'])
-                            match_score = 0
-                            total_fields = len(metadata_filter)
-                            
-                            # Score each metadata field match with improved matching algorithm
-                            for key, value in metadata_filter.items():
-                                if key in row_metadata:
-                                    # For string values, check for fuzzy match using similarity ratio
-                                    if isinstance(row_metadata[key], str) and isinstance(value, str):
-                                        # Simple fuzzy matching - can be improved with proper string similarity libraries
-                                        if value.lower() in row_metadata[key].lower() or row_metadata[key].lower() in value.lower():
-                                            # Give more weight to exact matches
-                                            if value.lower() == row_metadata[key].lower():
-                                                match_score += 1.0
-                                            else:
-                                                # Partial match - the longer the common part, the higher the score
-                                                common_length = min(len(value), len(row_metadata[key]))
-                                                match_score += 0.5 + (0.5 * len(value) / common_length)
-                                    # For list values, check for any overlap with improved scoring
-                                    elif isinstance(row_metadata[key], list) and isinstance(value, (str, list, tuple)):
-                                        matches_found = 0
-                                        if isinstance(value, (list, tuple)):
-                                            for v in value:
-                                                for item in row_metadata[key]:
-                                                    if isinstance(item, str) and isinstance(v, str):
-                                                        if v.lower() in item.lower() or item.lower() in v.lower():
-                                                            matches_found += 1
-                                                            # Bonus for exact match
-                                                            if v.lower() == item.lower():
-                                                                matches_found += 0.5
-                                        else:  # value is string
-                                            for item in row_metadata[key]:
-                                                if isinstance(item, str) and value.lower() in item.lower():
-                                                    matches_found += 1
-                                                    # Bonus for exact match
-                                                    if value.lower() == item.lower():
-                                                        matches_found += 0.5
-                                        
-                                        if matches_found > 0:
-                                            # Normalize score based on number of matches found and total items
-                                            match_score += min(1.0, matches_found / len(row_metadata[key]) if row_metadata[key] else 0)
-                                    # For exact matches
-                                    elif row_metadata[key] == value:
-                                        match_score += 1.0
-                            
-                            # Normalize match score by total fields in filter
-                            if total_fields > 0:
-                                normalized_score = match_score / total_fields
-                                # Only consider matches above a certain threshold (50%)
-                                if normalized_score >= 0.5:
-                                    row['match_score'] = normalized_score
-                                    filtered_results.append(row)
-                        except json.JSONDecodeError:
-                            continue
-                    
-                    # Sort by match score if we're using partial matching
-                    if filtered_results:
-                        filtered_results = sorted(filtered_results, key=lambda x: x.get('match_score', 0), reverse=True)
-                
-                # If we found results after filtering
+                # Sort by match score if we have filtered results
                 if filtered_results:
-                    logger.debug(f"After filtering: {len(filtered_results)} results")
+                    filtered_results = sorted(filtered_results, key=lambda x: x.get('match_score', 0), reverse=True)
                     results = pd.DataFrame(filtered_results)
+                    logger.debug(f"After filtering: {len(filtered_results)} results")
                 else:
                     # No results match filter - return top semantic matches instead of nothing
                     logger.warning("No results match the metadata filter, returning top semantic matches instead")
@@ -592,6 +556,99 @@ class VectorStore:
                 'exists': False,
                 'error': str(e)
             }
+
+    def rerank_documents(self, query_text: str, documents: List[Dict[str, Any]], n_results: int = None) -> List[Dict[str, Any]]:
+        """
+        Rerank documents using the configured reranker.
+        
+        Args:
+            query_text: The query text used for reranking
+            documents: List of document dictionaries to rerank
+            n_results: Number of results to return (default is Config.MAX_RESULTS)
+            
+        Returns:
+            List of reranked document dictionaries
+        """
+        if not documents:
+            logger.warning("No documents to rerank")
+            return []
+            
+        if not Config.USE_RERANKING:
+            logger.info("Reranking is disabled, returning original documents")
+            return documents[:n_results or Config.MAX_RESULTS]
+        
+        try:
+            n_results = n_results or Config.MAX_RESULTS
+            logger.info(f"Reranking {len(documents)} documents using {Config.RERANKER_TYPE} reranker")
+            
+            # Convert documents to a PyArrow table for LanceDB reranking
+            import pyarrow as pa
+            
+            # Extract text and other fields from documents
+            texts = [doc['text'] for doc in documents]
+            ids = [doc.get('id', f"doc_{i}") for i, doc in enumerate(documents)]
+            
+            # Create a PyArrow table
+            table_data = {
+                'id': pa.array(ids),
+                'text': pa.array(texts),
+                # Include other fields needed for reranking
+                'metadata': pa.array([json.dumps(doc.get('metadata', {})) for doc in documents])
+            }
+            
+            # Add scores if they exist
+            if 'score' in documents[0]:
+                table_data['_score'] = pa.array([float(doc.get('score', 0.0)) for doc in documents])
+                
+            pa_table = pa.Table.from_pydict(table_data)
+            
+            # Apply reranking based on the reranker type
+            if Config.RERANKER_TYPE.lower() == "cohere":
+                # Use LanceDB's CohereReranker directly
+                from lancedb.rerankers import CohereReranker
+                
+                reranker = CohereReranker(
+                    model_name=Config.RERANKER_MODEL,
+                    api_key=Config.COHERE_API_KEY,
+                    return_score="all"  # This prevents dropping _distance column
+                )
+                reranked_table = reranker.rerank_vector(query_text, pa_table)
+                
+                # Convert the reranked table back to documents
+                reranked_docs = []
+                for i in range(min(len(reranked_table), n_results)):
+                    row = reranked_table.slice(i, 1)
+                    doc = {
+                        'id': row['id'][0].as_py(),
+                        'text': row['text'][0].as_py(),
+                        'metadata': json.loads(row['metadata'][0].as_py())
+                    }
+                    
+                    # Add relevance score if available
+                    if '_relevance_score' in row.column_names:
+                        doc['score'] = float(row['_relevance_score'][0].as_py())
+                    elif '_score' in row.column_names:
+                        doc['score'] = float(row['_score'][0].as_py())
+                        
+                    reranked_docs.append(doc)
+                
+                logger.info(f"Successfully reranked documents, returning {len(reranked_docs)} results")
+                return reranked_docs
+            
+            elif Config.RERANKER_TYPE.lower() in ["linear", "rrf"]:
+                # For these reranker types, we'll perform reranking at the LanceDB query level
+                # This is already handled in the query method, so just return the top documents
+                logger.info(f"Using {Config.RERANKER_TYPE} reranker which was applied during the query")
+                return documents[:n_results]
+            
+            else:
+                logger.warning(f"Unknown reranker type: {Config.RERANKER_TYPE}, returning original documents")
+                return documents[:n_results]
+                
+        except Exception as e:
+            logger.error(f"Error during reranking: {str(e)}", exc_info=True)
+            # Fall back to returning the original documents
+            return documents[:n_results or Config.MAX_RESULTS]
 
     def cleanup(self):
         """Remove the existing table and recreate it."""

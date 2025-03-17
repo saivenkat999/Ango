@@ -452,8 +452,7 @@ class OrchestratorAgent:
         
         self.retriever = RetrieverAgent(
             model_id=model_id,
-            vector_store=self.vector_store,
-            cohere_api_key=Config.COHERE_API_KEY
+            vector_store=self.vector_store
         )
         
         # Create toolkits

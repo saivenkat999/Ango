@@ -23,6 +23,11 @@ class Config:
     SEARCH_TYPE = os.getenv("SEARCH_TYPE", "hybrid")
     BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
     
+    # Reranking configuration
+    RERANKER_TYPE = os.getenv("RERANKER_TYPE", "cohere")  # Options: "linear", "cohere", "rrf"
+    RERANKER_WEIGHT = float(os.getenv("RERANKER_WEIGHT", "0.7"))  # Used for linear combination reranker
+    RERANKER_MODEL = os.getenv("RERANKER_MODEL", "rerank-multilingual-v3.0")  # Used for Cohere reranker
+    
     # Document processing configuration
     DOCUMENTS_DIR = os.getenv("DOCUMENTS_DIR", "./data/documents")
     CHUNKING_STRATEGY = os.getenv("CHUNKING_STRATEGY", "recursive")
