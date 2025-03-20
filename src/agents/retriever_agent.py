@@ -5,6 +5,9 @@ from agno.models.openai import OpenAIChat
 from agno.tools import Toolkit
 from pydantic import BaseModel, Field
 from ..utils.config import Config
+import json
+import re
+from functools import lru_cache
 
 from ..utils.vector_store import VectorStore
 
@@ -42,15 +45,15 @@ class KeywordExtractor:
     
     def __init__(self):
         """Initialize keyword mappings for different document types."""
-        # Technology-specific keywords
-        self.tech_keywords = {
+        # Technology-specific keywords (connection types)
+        self.connection_type_keywords = {
             "odbc": {"odbc", "open database connectivity", "dsn", "data source name", "driver manager"},
             "jdbc": {"jdbc", "java database", "connection pool", "java", "j2ee", "connection url"},
-            "ado": {"ado", "ado.net", ".net", "c#", "vb.net", "connection string", "connection properties"},
+            "hdp": {"hdp", "hybrid data pipeline", "data pipeline", "progress datadirect", "odata", "data gateway", "universal connectivity", "on-premises connector"},
         }
         
         # Database-specific keywords
-        self.db_keywords = {
+        self.database_type_keywords = {
             "redshift": {"redshift", "amazon redshift", "aws", "columnar", "mpp", "massively parallel"},
             "oracle": {"oracle", "pl/sql", "tns", "tnsnames", "tablespace", "oracle database"},
             "sqlserver": {"sql server", "microsoft sql", "t-sql", "tsql", "mssql", "windows authentication"},
@@ -58,12 +61,24 @@ class KeywordExtractor:
             "mysql": {"mysql", "my.cnf", "innodb", "myisam"},
         }
         
-        # Feature-specific keywords
+        # Content category keywords
+        self.content_category_keywords = {
+            "connection": {"connect", "connection", "setup", "configure", "establish", "datasource", "connectionstring"},
+            "authentication": {"auth", "authentication", "login", "credential", "password", "username", "sso", "identity"},
+            "querying": {"query", "sql", "select", "execute", "statement", "prepared statement", "result", "fetch"},
+            "configuration": {"config", "property", "setting", "parameter", "option", "driver", "setup", "registry"},
+            "performance": {"performance", "tuning", "optimize", "cache", "connection pool", "pooling", "timeout"},
+            "troubleshooting": {"error", "troubleshoot", "debug", "issue", "problem", "failure", "diagnostic", "exception"},
+        }
+        
+        # Backward compatibility mappings
+        self.tech_keywords = self.connection_type_keywords
+        self.db_keywords = self.database_type_keywords
         self.feature_keywords = {
             "encryption": {"encrypt", "encryption", "ssl", "tls", "secure", "security", "certificate"},
-            "authentication": {"auth", "authentication", "login", "credential", "password", "username", "sso"},
-            "performance": {"performance", "tuning", "optimize", "cache", "connection pool", "pooling"},
-            "troubleshooting": {"error", "troubleshoot", "debug", "issue", "problem", "failure", "diagnostic"},
+            "authentication": self.content_category_keywords["authentication"],
+            "performance": self.content_category_keywords["performance"],
+            "troubleshooting": self.content_category_keywords["troubleshooting"],
         }
 
     def extract_keywords(self, query: str) -> Dict[str, Set[str]]:
@@ -78,26 +93,84 @@ class KeywordExtractor:
         """
         query = query.lower()
         results = {
+            "connection_type": set(),  # New field name
+            "database_type": set(),    # New field name
+            "content_category": set(),  # New field
+            # Keep old field names for backward compatibility
             "technology": set(),
             "database": set(),
             "feature": set()
         }
         
-        # Check for technology keywords
-        for tech, keywords in self.tech_keywords.items():
+        # Check if this is a comparative query
+        is_comparative = any(indicator in query for indicator in [
+            " vs ", " versus ", " compare ", " difference between ", " or ", " and "
+        ])
+        
+        # For comparative queries, be more selective with keyword matching
+        if is_comparative:
+            # For comparative queries, only extract connection_type and database_type
+            # without adding additional content categories or features
+            
+            # Check for database types directly - higher precision for comparative queries
+            database_types = get_common_patterns("database_types")
+            for db_type in database_types:
+                # Check for exact database names in comparative queries
+                if f" {db_type} " in f" {query} " or f"{db_type}," in query or query.endswith(f" {db_type}"):
+                    results["database_type"].add(db_type)
+                    results["database"].add(db_type)  # For backward compatibility
+            
+            # Check for connection types directly - higher precision for comparative queries
+            connection_types = get_common_patterns("connection_types")
+            for conn_type in connection_types:
+                # Check for exact connection types in comparative queries
+                if f" {conn_type} " in f" {query} " or f"{conn_type}," in query or query.endswith(f" {conn_type}"):
+                    results["connection_type"].add(conn_type)
+                    results["technology"].add(conn_type)  # For backward compatibility
+            
+            return results
+        
+        # Non-comparative queries use the original algorithm
+        
+        # Check for connection type keywords
+        for tech, keywords in self.connection_type_keywords.items():
             if any(kw in query for kw in keywords):
-                results["technology"].add(tech)
+                results["connection_type"].add(tech)
+                results["technology"].add(tech)  # For backward compatibility
                 
         # Check for database keywords
-        for db, keywords in self.db_keywords.items():
+        for db, keywords in self.database_type_keywords.items():
             if any(kw in query for kw in keywords):
-                results["database"].add(db)
+                results["database_type"].add(db)
+                results["database"].add(db)  # For backward compatibility
                 
-        # Check for feature keywords
+        # Check for content category keywords
+        for category, keywords in self.content_category_keywords.items():
+            if any(kw in query for kw in keywords):
+                results["content_category"].add(category)
+                
+        # For backward compatibility: check for feature keywords
         for feature, keywords in self.feature_keywords.items():
             if any(kw in query for kw in keywords):
                 results["feature"].add(feature)
                 
+        # Attempt direct detection for common patterns if other methods failed
+        if not results["connection_type"]:
+            # Try direct pattern matching for connection types
+            connection_types = get_common_patterns("connection_types")
+            for conn_type in connection_types:
+                if conn_type in query or conn_type.upper() in query:
+                    results["connection_type"].add(conn_type)
+                    results["technology"].add(conn_type)  # For backward compatibility
+        
+        if not results["database_type"]:
+            # Try direct pattern matching for database types
+            database_types = get_common_patterns("database_types")
+            for db_type in database_types:
+                if db_type in query or db_type.capitalize() in query:
+                    results["database_type"].add(db_type)
+                    results["database"].add(db_type)  # For backward compatibility
+                    
         return results
     
     def enhance_metadata_filter(self, query: str, metadata_filter: Dict[str, Any]) -> Dict[str, Any]:
@@ -111,23 +184,123 @@ class KeywordExtractor:
         Returns:
             Enhanced metadata filter
         """
-        # Make a copy to avoid modifying the original filter
+        # Start with a copy of the existing filter
         enhanced_filter = metadata_filter.copy() if metadata_filter else {}
         
-        # Extract keywords from query
+        # Extract keywords from the query
         extracted = self.extract_keywords(query)
         
-        # Enhance filter with extracted keywords
-        for category, values in extracted.items():
-            if values:
-                # If only one value is found, add it directly
-                if len(values) == 1:
-                    enhanced_filter[category] = next(iter(values))
-                # Otherwise, add as a list
-                elif len(values) > 1:
-                    enhanced_filter[category] = list(values)
-                    
+        # For comparative queries, don't apply strict database filters
+        query_lower = query.lower()
+        if any(indicator in query_lower for indicator in [
+            " vs ", " versus ", " compare ", " difference between ", " or ", " and "
+        ]):
+            # Detected a likely comparative query
+            logger.info("Detected comparative query, using relaxed metadata filtering")
+            
+            # Only add connection_type for comparative queries if found
+            if extracted["connection_type"] and "connection_type" not in enhanced_filter:
+                connection_type = next(iter(extracted["connection_type"]))
+                enhanced_filter["connection_type"] = connection_type
+                
+            # Do not restrict by database_type for comparative queries
+            if "database_type" in enhanced_filter:
+                logger.info(f"Removing database_type filter for comparative query")
+                del enhanced_filter["database_type"]
+                
+            return enhanced_filter
+        
+        # For non-comparative queries, apply normal filtering
+        
+        # Update connection_type if found in query and not already set
+        if extracted["connection_type"] and "connection_type" not in enhanced_filter:
+            # Use the first one found (most likely match)
+            connection_type = next(iter(extracted["connection_type"]))
+            enhanced_filter["connection_type"] = connection_type
+            logger.debug(f"Added connection_type filter: {connection_type}")
+            
+            # For backward compatibility
+            if "technology" not in enhanced_filter:
+                enhanced_filter["technology"] = connection_type
+        
+        # Update database_type if found in query and not already set
+        if extracted["database_type"] and "database_type" not in enhanced_filter:
+            # Use the first one found (most likely match)
+            database_type = next(iter(extracted["database_type"]))
+            enhanced_filter["database_type"] = database_type
+            logger.debug(f"Added database_type filter: {database_type}")
+            
+            # For backward compatibility
+            if "database" not in enhanced_filter:
+                enhanced_filter["database"] = database_type
+        
+        # Update content_category if found and not already set
+        if extracted["content_category"] and "content_category" not in enhanced_filter:
+            # Use the first one found (most likely match)
+            content_category = next(iter(extracted["content_category"]))
+            enhanced_filter["content_category"] = content_category
+            logger.debug(f"Added content_category filter: {content_category}")
+            
+        # For backward compatibility: add feature if found and not set
+        if extracted["feature"] and "feature" not in enhanced_filter:
+            # Use the first one found (most likely match)
+            feature = next(iter(extracted["feature"]))
+            enhanced_filter["feature"] = feature
+            logger.debug(f"Added feature filter: {feature}")
+            
         return enhanced_filter
+
+    def enhance_query(self, query_text: str, metadata_filter: Dict[str, Any]) -> str:
+        """
+        Enhance the query text with additional context based on metadata filters.
+        
+        Args:
+            query_text: The original query text
+            metadata_filter: Metadata filters to derive context from
+            
+        Returns:
+            Enhanced query text with additional context
+        """
+        # Check if this is a comparative query - if so, don't enhance
+        query_lower = query_text.lower()
+        if any(indicator in query_lower for indicator in [
+            " vs ", " versus ", " compare ", " difference between ", " or ", " and "
+        ]):
+            logger.info("Detected comparative query, skipping query enhancement")
+            return query_text
+            
+        enhanced_query = query_text
+        
+        # Extract key context from metadata filters
+        connection_type = metadata_filter.get("connection_type")
+        database_type = metadata_filter.get("database_type")
+        content_category = metadata_filter.get("content_category")
+        
+        # Don't modify the query if it already contains these terms
+        
+        # Add connection type context if not already in query
+        if connection_type and connection_type not in query_lower:
+            # For HDP, use the full name for better context
+            if connection_type == "hdp" and "hybrid data pipeline" not in query_lower:
+                enhanced_query += f" for Hybrid Data Pipeline"
+            elif connection_type not in query_lower:
+                enhanced_query += f" for {connection_type.upper()}"
+        
+        # Add database type context if not already in query
+        if database_type and database_type not in query_lower:
+            enhanced_query += f" with {database_type}"
+        
+        # Add content category context for certain categories
+        if content_category and content_category not in query_lower:
+            if content_category == "authentication":
+                enhanced_query += " for authentication purposes"
+            elif content_category == "connection":
+                enhanced_query += " when establishing connections"
+            elif content_category == "configuration":
+                enhanced_query += " configuration"
+        
+        logger.debug(f"Enhanced query from '{query_text}' to '{enhanced_query}'")
+        return enhanced_query
 
 class InfoRetrievalToolkit(Toolkit):
     """
@@ -151,6 +324,10 @@ class InfoRetrievalToolkit(Toolkit):
         # Initialize the keyword extractor
         self.keyword_extractor = KeywordExtractor()
 
+        # A simple cache for recently retrieved information
+        self.query_cache = {}
+        self.max_cache_size = 20  # Maximum number of cached queries
+
         # We no longer need to initialize our own reranker,
         # since we'll use the one from the vector_store
         # which is already configured according to Config.RERANKER_TYPE
@@ -158,6 +335,97 @@ class InfoRetrievalToolkit(Toolkit):
 
         # Register the retrieve_information function
         self.register(self.retrieve_information)
+        
+    def decompose_complex_query(self, query_text: str) -> List[str]:
+        """
+        Decompose a complex query into simpler subqueries for better results.
+        
+        Args:
+            query_text: The original query text
+            
+        Returns:
+            List of subqueries, or just the original query if decomposition not needed
+        """
+        # Simple rule-based decomposition - look for indicators of complex queries
+        query_lower = query_text.lower()
+        
+        # For queries specifically about authentication methods between database types,
+        # return the original query to ensure we search broadly across all databases
+        if "authentication" in query_lower and any(db_type in query_lower for db_type in get_common_patterns("database_types")):
+            if any(comp in query_lower for comp in [" vs ", " versus ", " compare ", " difference ", " and ", " or "]):
+                logger.info("Detected database authentication comparison query, keeping as single query")
+                return [query_text]
+        
+        # Check if the query contains multiple distinct questions
+        multiple_question_indicators = [
+            " and also ", " also ", " additionally ", 
+            " what about ", " how about ", " moreover ",
+            "? ", "; "
+        ]
+        
+        # Check if query contains comparative elements
+        comparative_indicators = [
+            " vs ", " versus ", " compare ", " difference between ",
+            " pros and cons ", " advantages and disadvantages "
+        ]
+        
+        # Check for decomposition needs
+        needs_decomposition = False
+        
+        # Multiple questions in one
+        if any(indicator in query_lower for indicator in multiple_question_indicators):
+            needs_decomposition = True
+            
+        # Comparative questions
+        if any(indicator in query_lower for indicator in comparative_indicators):
+            needs_decomposition = True
+            
+        # If we don't need decomposition, return the original query
+        if not needs_decomposition:
+            return [query_text]
+            
+        # Let's decompose based on the query type
+        
+        # First try to split by question marks
+        if "?" in query_text:
+            subqueries = [q.strip() + "?" for q in query_text.split("?") if q.strip()]
+            if len(subqueries) > 1:
+                logger.info(f"Decomposed query into {len(subqueries)} subqueries based on question marks")
+                return subqueries
+        
+        # For database comparisons, keep as a single query rather than decomposing
+        # This ensures we get broad results that can be compared properly
+        database_types = get_common_patterns("database_types") 
+        mentioned_dbs = [db for db in database_types if db in query_lower]
+        if len(mentioned_dbs) > 1 and any(comp in query_lower for comp in comparative_indicators):
+            logger.info("Query compares multiple databases, keeping as a single query")
+            return [query_text]
+                
+        # For comparative queries, break into two separate queries about each entity
+        for indicator in comparative_indicators:
+            if indicator in query_lower:
+                parts = query_lower.split(indicator)
+                if len(parts) == 2:
+                    # Extract topics being compared
+                    topic1 = parts[0].strip()
+                    topic2 = parts[1].strip()
+                    
+                    # For "difference between A and B" pattern
+                    if indicator == " difference between " and " and " in topic2:
+                        topic2_parts = topic2.split(" and ", 1)
+                        if len(topic2_parts) == 2:
+                            topic1 = topic2_parts[0].strip()
+                            topic2 = topic2_parts[1].strip()
+                    
+                    # Create focused queries for each topic
+                    subquery1 = f"Tell me about {topic1}"
+                    subquery2 = f"Tell me about {topic2}"
+                    
+                    logger.info(f"Decomposed comparative query into two topic-specific subqueries")
+                    return [subquery1, subquery2]
+        
+        # If we can't decompose in a smart way, just return the original
+        return [query_text]
         
     def retrieve_information(self, retrieval_query: RetrievalQuery) -> Tuple[str, List[Dict[str, Any]]]:
         """
@@ -196,6 +464,91 @@ class InfoRetrievalToolkit(Toolkit):
             query_text = retrieval_query.query
             metadata_filter = retrieval_query.metadata_filter or {}
             
+            # Check if this is a complex query that should be decomposed
+            subqueries = self.decompose_complex_query(query_text)
+            
+            # If we have multiple subqueries, handle each separately and combine results
+            if len(subqueries) > 1:
+                logger.info(f"Processing complex query as {len(subqueries)} subqueries")
+                all_results = []
+                all_formatted = []
+                
+                # Process each subquery with a smaller result count
+                n_per_query = max(2, retrieval_query.n_results // len(subqueries))
+                
+                for i, subquery in enumerate(subqueries):
+                    logger.info(f"Processing subquery {i+1}/{len(subqueries)}: '{subquery}'")
+                    # Create a new retrieval query for this subquery
+                    subquery_retrieval = RetrievalQuery(
+                        query=subquery,
+                        n_results=n_per_query,
+                        metadata_filter=metadata_filter,
+                        search_type=retrieval_query.search_type,
+                        expected_result_type=retrieval_query.expected_result_type,
+                        query_context=retrieval_query.query_context
+                    )
+                    
+                    # Get results for this subquery
+                    formatted_context, document_results = self._process_single_query(subquery_retrieval)
+                    
+                    if document_results:
+                        # Add subquery indicator to the formatted context
+                        subquery_header = f"**Subquery {i+1}: {subquery}**\n\n"
+                        all_formatted.append(subquery_header + formatted_context)
+                        all_results.extend(document_results)
+                
+                # Combine all results
+                if not all_results:
+                    return "No information related to your query was found in the knowledge base.", []
+                
+                # Return the combined results
+                combined_context = "\n\n".join(all_formatted)
+                return combined_context, all_results[:retrieval_query.n_results]
+            
+            # For single queries, process normally
+            return self._process_single_query(retrieval_query)
+            
+        except Exception as e:
+            logger.error(f"Error retrieving information: {str(e)}", exc_info=True)
+            error_message = f"Error retrieving information: {str(e)}"
+            return error_message, []
+            
+    def _process_single_query(self, retrieval_query: RetrievalQuery) -> Tuple[str, List[Dict[str, Any]]]:
+        """
+        Process a single query for information retrieval.
+        
+        This is the core implementation that handles a simple non-decomposed query.
+        
+        Args:
+            retrieval_query: The query to process
+            
+        Returns:
+            Tuple of (formatted_context, document_results)
+        """
+        try:
+            # Extract query text and other parameters
+            query_text = retrieval_query.query
+            metadata_filter = retrieval_query.metadata_filter or {}
+            
+            # Check cache first for identical query with same metadata filters
+            cache_key = f"{query_text}_{json.dumps(metadata_filter, sort_keys=True)}"
+            if cache_key in self.query_cache:
+                logger.info(f"Cache hit for query: '{query_text}'")
+                cached_result = self.query_cache[cache_key]
+                return cached_result[0], cached_result[1]
+            
+            # Check if this is a comparative query - if so, request more results
+            query_lower = query_text.lower()
+            is_comparative = any(indicator in query_lower for indicator in [
+                " vs ", " versus ", " compare ", " difference between ", " or ", " and "
+            ])
+            
+            # Use more results for comparative queries to get better coverage
+            n_results = retrieval_query.n_results
+            if is_comparative:
+                n_results = max(n_results * 2, 10)  # Double results, minimum 10
+                logger.info(f"Detected comparative query, increasing result count to {n_results}")
+            
             # Enhance metadata filters with keyword extraction
             enhanced_filter = self.keyword_extractor.enhance_metadata_filter(query_text, metadata_filter)
             
@@ -204,20 +557,30 @@ class InfoRetrievalToolkit(Toolkit):
                 logger.info(f"Enhanced metadata filters from: {metadata_filter} to: {enhanced_filter}")
                 metadata_filter = enhanced_filter
             
+            # Enhance the query with additional context from metadata
+            enhanced_query = self.keyword_extractor.enhance_query(query_text, metadata_filter)
+            
+            # Use the enhanced query if it's significantly different
+            if len(enhanced_query) > len(query_text) + 5:  # Only use if meaningful additions were made
+                logger.info(f"Using enhanced query: '{enhanced_query}'")
+                query_for_search = enhanced_query
+            else:
+                query_for_search = query_text
+            
             # Log the retrieval request
-            logger.info(f"Retrieving information for query: '{query_text}', n_results={retrieval_query.n_results}, filters={metadata_filter}")
+            logger.info(f"Retrieving information for query: '{query_for_search}', n_results={n_results}, filters={metadata_filter}")
 
             # The VectorStore returns a list of document dictionaries
             document_results = self.vector_store.query(
-                query_text=query_text,
-                n_results=retrieval_query.n_results,
+                query_text=query_for_search,
+                n_results=n_results,
                 metadata_filter=metadata_filter,
                 search_type=retrieval_query.search_type,
             )
 
             # Check if we have any results
             if not document_results or len(document_results) == 0:
-                logger.warning(f"No results found for query: {query_text}")
+                logger.warning(f"No results found for query: {query_for_search}")
                 return "No information related to your query was found in the knowledge base.", []
 
             # Defensive validation of document_results to ensure proper format
@@ -244,7 +607,7 @@ class InfoRetrievalToolkit(Toolkit):
 
             # If validation removed all results
             if not validated_results:
-                logger.warning(f"No valid results remained after validation for query: {query_text}")
+                logger.warning(f"No valid results remained after validation for query: {query_for_search}")
                 return "No valid information related to your query was found in the knowledge base.", []
                 
             document_results = validated_results
@@ -254,9 +617,9 @@ class InfoRetrievalToolkit(Toolkit):
             if Config.USE_RERANKING:
                 # Use the VectorStore's dedicated reranking method
                 reranked_results = self.vector_store.rerank_documents(
-                    query_text=query_text,
+                    query_text=query_for_search,
                     documents=document_results,
-                    n_results=retrieval_query.n_results
+                    n_results=retrieval_query.n_results if not is_comparative else n_results
                 )
                 
                 # If reranking was successful, use the reranked results
@@ -270,14 +633,23 @@ class InfoRetrievalToolkit(Toolkit):
             # Log success
             logger.info(f"Successfully retrieved {len(document_results)} results for query: '{query_text}'")
 
+            # Update cache with this result
+            self.query_cache[cache_key] = (formatted_context, document_results)
+            
+            # Maintain cache size limit
+            if len(self.query_cache) > self.max_cache_size:
+                # Remove oldest entry (first key)
+                oldest_key = next(iter(self.query_cache))
+                self.query_cache.pop(oldest_key)
+
             # Return both the formatted context and the document results
             return formatted_context, document_results
 
         except Exception as e:
-            logger.error(f"Error retrieving information: {str(e)}", exc_info=True)
+            logger.error(f"Error in _process_single_query: {str(e)}", exc_info=True)
             error_message = f"Error retrieving information: {str(e)}"
             return error_message, []
-
+            
     def _format_context(self, results: List[Dict], expected_result_type: str = "factual") -> str:
         """
         Format the retrieved results into a readable context string.
@@ -306,33 +678,103 @@ class InfoRetrievalToolkit(Toolkit):
 
         # Format each result
         sections = []
+        
+        # Check if we need to add a no-specific-info warning at the beginning
+        add_general_warning = False
+        requested_db_type = None
+        has_db_specific_info = False
+        
+        # Detect if there's a specific database requested but no matching info
+        for result in results:
+            metadata = result.get("metadata", {})
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except:
+                    metadata = {}
+                    
+            # Extract database type
+            db_type = metadata.get("database_type", metadata.get("document_subject", ""))
+            if db_type and "warning" in metadata:
+                # Found a warning which likely means a database mismatch
+                requested_db_type = metadata.get("warning", "").split("for ")[-1].split(".")[0]
+            elif db_type:
+                # Check if we have at least one document matching the requested db
+                if requested_db_type and db_type.lower() == requested_db_type.lower():
+                    has_db_specific_info = True
+
+        # Add general warning if requested DB info wasn't found
+        if requested_db_type and not has_db_specific_info:
+            add_general_warning = True
+            
+        # Add a header warning if needed
+        if add_general_warning:
+            warning = (f"⚠️ **Note**: No specific information for {requested_db_type} was found in the knowledge base. "
+                      f"The following information may refer to other database systems and may not be directly applicable.\n\n")
+            sections.append(warning)
 
         for i, result in enumerate(results):
             # Format the text content
             content = result["text"]
-
+            
+            # Get source info from metadata
+            metadata = result.get("metadata", {})
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except:
+                    metadata = {}
+                    
+            # Extract useful metadata
+            connection_type = metadata.get("connection_type", metadata.get("document_type", "")).upper()
+            database_type = metadata.get("database_type", metadata.get("document_subject", "")).capitalize()
+            content_category = metadata.get("content_category", "").capitalize()
+            source_document = metadata.get("source_document", metadata.get("source", ""))
+            warning = metadata.get("warning", "")
+            
+            # Create header with metadata
+            header = f"**DOCUMENT {i+1}**"
+            
+            # Add source information when available
+            if connection_type and database_type:
+                header = f"**{connection_type}"
+                if database_type != "General":
+                    header += f" - {database_type}"
+                if content_category and content_category != "General":
+                    header += f" ({content_category})"
+                header += "**"
+            
+            # Add warning for database-specific content that doesn't match requested database
+            warning_text = ""
+            if warning:
+                warning_text = f"\n\n⚠️ *{warning}*"
+            
             # Format based on expected_result_type, aligned with the query model types
             if expected_result_type == "conceptual":
                 # For conceptual/explanatory content
-                section = f"**Information {i+1}**\n\n{content}\n\n"
+                section = f"{header}\n\n{content}{warning_text}\n\n"
 
             elif expected_result_type == "procedural":
                 # For procedural content with steps
-                section = f"**Procedure {i+1}**\n\n{content}\n\n"
-
+                section = f"{header}\n\n{content}{warning_text}\n\n"
+                
             elif expected_result_type == "opinion":
                 # For opinion-based content
-                section = f"**Perspective {i+1}**\n\n{content}\n\n"
+                section = f"{header}\n\n{content}{warning_text}\n\n"
 
             else:
                 # Default factual format
-                section = f"**Document {i+1}**\n\n{content}\n\n"
+                section = f"{header}\n\n{content}{warning_text}\n\n"
+                
+            # Add source document reference if available
+            if source_document:
+                section += f"*Source: {source_document}*\n\n"
 
             sections.append(section)
-
+        
         # Combine everything - no header about search methods
         formatted_context = "\n".join(sections)
-
+        
         return formatted_context
 
     def retrieve_with_results(self, retrieval_query: RetrievalQuery) -> Tuple[str, List[Dict[str, Any]]]:
@@ -639,3 +1081,23 @@ class RetrieverAgent:
 
 # For backward compatibility
 InfoRetrievalToolkit = InfoRetrievalToolkit
+
+@lru_cache(maxsize=50)
+def get_common_patterns(key: str) -> List[str]:
+    """
+    Cache common patterns used in queries to improve performance.
+    This is useful for frequently accessed patterns in keyword extraction.
+    
+    Args:
+        key: A unique key for the pattern type
+        
+    Returns:
+        List of pattern strings
+    """
+    if key == "connection_types":
+        return ["jdbc", "odbc", "hdp"]
+    elif key == "database_types":
+        return ["sqlserver", "oracle", "redshift", "postgres", "mysql"]
+    elif key == "content_categories":
+        return ["connection", "authentication", "querying", "configuration", "performance", "troubleshooting"]
+    return []

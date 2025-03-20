@@ -19,7 +19,7 @@ class Config:
     # Vector store configuration
     PERSISTENCE_DIRECTORY = os.getenv("PERSISTENCE_DIRECTORY", "./data/vector_store")
     COLLECTION_NAME = os.getenv("COLLECTION_NAME", "document_store")
-    EMBEDDING_MODEL_ID = os.getenv("EMBEDDING_MODEL_ID", "BAAI/bge-small-en-v1.5")
+    EMBEDDING_MODEL_ID = os.getenv("EMBEDDING_MODEL_ID", "BAAI/bge-small-en-v1.5")  #BAAI/bge-large-en, BAAI/bge-small-en-v1.5
     SEARCH_TYPE = os.getenv("SEARCH_TYPE", "hybrid")
     BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
     
@@ -35,12 +35,12 @@ class Config:
     CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "128"))
     
     # Response settings
-    RESPONSE_FORMAT = os.getenv("RESPONSE_FORMAT", "balanced")  # concise, balanced, detailed
-    MAX_RESPONSE_LENGTH = int(os.getenv("MAX_RESPONSE_LENGTH", "1500"))
+    RESPONSE_FORMAT = os.getenv("RESPONSE_FORMAT", "concise")  # concise, balanced, detailed
+    MAX_RESPONSE_LENGTH = int(os.getenv("MAX_RESPONSE_LENGTH", "2000"))
     MAX_RESULTS = int(os.getenv("MAX_RESULTS", "4"))
     MAX_RETRIEVAL_RESULTS = int(os.getenv("MAX_RETRIEVAL_RESULTS", str(MAX_RESULTS)))
-    FORMAT_MARKDOWN = os.getenv("FORMAT_MARKDOWN", "true").lower() in ("true", "yes", "1", "t")
-    INCLUDE_SOURCES = os.getenv("INCLUDE_SOURCES", "true").lower() in ("true", "yes", "1", "t")
+    FORMAT_MARKDOWN = os.getenv("FORMAT_MARKDOWN", "false").lower() in ("true", "yes", "1", "t")  # When true, LLM is instructed to use markdown for formatting
+    INCLUDE_SOURCES = os.getenv("INCLUDE_SOURCES", "false").lower() in ("true", "yes", "1", "t")
     
     # AI model configuration
     MODEL_ID = os.getenv("MODEL_ID", "gpt-4o")

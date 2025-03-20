@@ -6,6 +6,7 @@ import logging
 from src.utils.vector_store import VectorStore
 from src.agents.orchestrator_agent import OrchestratorAgent
 from src.utils.config import Config
+from agno.models.openai import OpenAIChat
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -26,10 +27,10 @@ def print_banner():
     print(" "*25 + "ADVANCED MULTI-AGENT RAG SYSTEM")
     print("="*80)
     print("\nWelcome to the Advanced Multi-Agent RAG System with LlamaCloud, LanceDB, and Reranking!")
-    print("This system uses three specialized agents to provide intelligent document retrieval:")
-    print("  1. Orchestrator Agent: Coordinates tasks and manages user interaction")
-    print("  2. Document Processor: Analyzes documents using LlamaCloud and Agno chunking")
-    print("  3. Retriever Agent: Searches for relevant information with hybrid search and reranking")
+    print("This system uses a sophisticated retrieval-augmented generation pipeline:")
+    print("  1. Query Analysis: Automatically detects query type and adapts search strategy")
+    print("  2. Document Retrieval: Searches for relevant information with hybrid search and reranking")
+    print("  3. Response Generation: Creates well-formatted responses tailored to the query type")
     print("\nSpecial commands:")
     print("  - 'process documents': Index documents in the data/documents directory")
     print("  - 'set format <concise|balanced|detailed>': Change response format")
@@ -52,9 +53,13 @@ def main():
     # Initialize the vector store using configuration from .env
     vector_store = VectorStore()
     
+    # Initialize the model
+    model = OpenAIChat(id=Config.MODEL_ID, api_key=Config.OPENAI_API_KEY)
+    
     # Initialize orchestrator with configuration
     orchestrator = OrchestratorAgent(
-        vector_store=vector_store
+        vector_store=vector_store,
+        model=model
     )
     
     # Show system introduction
@@ -80,10 +85,17 @@ def main():
             break
             
         # Process the user's query using the orchestrator
-        response = orchestrator.process_query(user_input)
+        response_data = orchestrator.process_query(user_input)
         
-        # Display the response
-        print(f"\nRAG [{Config.RESPONSE_FORMAT.upper()}]: {response}")
+        # Extract response and result type
+        response_text = response_data.get("response", "No response generated.")
+        result_type = response_data.get("result_type", "factual")
+        
+        # Display the response - ensure it's clean text without dictionary formatting
+        print(f"\nRAG [{result_type.upper()}]:")
+        print("-" * 80)  # Add a separator line for better visual structure
+        print(f"{response_text}")
+        print("-" * 80)  # Add a closing separator
         
 if __name__ == "__main__":
     main() 

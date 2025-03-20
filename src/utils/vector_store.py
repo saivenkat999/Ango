@@ -439,36 +439,113 @@ class VectorStore:
                 original_results = results.copy()
                 filtered_results = []
                 
-                # First pass: try to find exact matches with relaxed filtering
+                # Check if there are database or connection type specific filters
+                requested_connection_type = metadata_filter.get("connection_type")
+                requested_database_type = metadata_filter.get("database_type")
+                have_specific_filter = requested_connection_type or requested_database_type
+                
+                # First pass: enhanced filtering that understands the hierarchical structure
                 for _, row in results.iterrows():
                     try:
+                        # Parse metadata as JSON
                         row_metadata = json.loads(row['metadata'])
-                        match = True
-                        match_score = 0
                         
-                        # Check if any filter conditions match (relaxed matching)
+                        # Initialize scoring
+                        match_score = 0
+                        total_match_factors = 0
+                        matches = {}
+                        
+                        # Handle hierarchical filtering with specific rules for connection and database types
+                        if have_specific_filter:
+                            # Connection type matching (level 1)
+                            if requested_connection_type:
+                                total_match_factors += 2  # Give more weight to connection type
+                                conn_type = row_metadata.get("connection_type", row_metadata.get("document_type"))
+                                if conn_type and conn_type.lower() == requested_connection_type.lower():
+                                    match_score += 2
+                                    matches["connection_type"] = True
+                                elif not row_metadata.get("connection_specific", True):
+                                    # Item marked as not connection-specific, so it applies broadly
+                                    match_score += 1
+                                    matches["connection_type"] = "partial"
+                            
+                            # Database type matching (level 2)
+                            if requested_database_type:
+                                total_match_factors += 2  # Give more weight to database type
+                                db_type = row_metadata.get("database_type", row_metadata.get("document_subject"))
+                                if db_type and db_type.lower() == requested_database_type.lower():
+                                    match_score += 2
+                                    matches["database_type"] = True
+                                elif not row_metadata.get("database_specific", True):
+                                    # Item marked as not database-specific, so it applies broadly
+                                    match_score += 1
+                                    matches["database_type"] = "partial"
+                                # Check if explicitly marked as not applicable to this DB
+                                not_applicable = row_metadata.get("not_applicable_to", [])
+                                if isinstance(not_applicable, list) and requested_database_type.lower() in [x.lower() for x in not_applicable]:
+                                    match_score = 0  # Explicitly exclude this result
+                                    matches["database_type"] = False
+                        
+                        # Handle any other metadata filters
                         for key, value in metadata_filter.items():
+                            # Skip connection and database type since we already handled them
+                            if key in ["connection_type", "database_type"]:
+                                continue
+                                
+                            total_match_factors += 1
+                            
+                            # Check if this key exists in metadata
                             if key in row_metadata:
                                 # For string values, check for partial match
                                 if isinstance(row_metadata[key], str) and isinstance(value, str):
                                     if value.lower() in row_metadata[key].lower():
                                         match_score += 1
+                                        matches[key] = True
                                 # For list values, check for any overlap
                                 elif isinstance(row_metadata[key], list) and isinstance(value, (str, list, tuple)):
                                     if isinstance(value, (list, tuple)):
                                         if any(v.lower() in str(item).lower() for v in value for item in row_metadata[key]):
                                             match_score += 1
+                                            matches[key] = True
                                     else:
                                         if any(value.lower() in str(item).lower() for item in row_metadata[key]):
                                             match_score += 1
+                                            matches[key] = True
                                 # For exact matches
                                 elif row_metadata[key] == value:
                                     match_score += 1
+                                    matches[key] = True
+                                    
+                                # Check for partial matches in keywords field
+                                elif key == "keywords" and "keywords" in row_metadata and isinstance(row_metadata["keywords"], list):
+                                    if isinstance(value, str) and any(value.lower() in k.lower() for k in row_metadata["keywords"]):
+                                        match_score += 0.5  # Partial credit for keyword match
+                                        matches[key] = "partial"
+                            
+                            # Special handling for content category
+                            elif key == "content_category" and "content_category" in row_metadata:
+                                if value.lower() == row_metadata["content_category"].lower():
+                                    match_score += 1
+                                    matches[key] = True
                         
-                        # Consider a match if at least one filter condition matches
-                        if match_score > 0:
-                            row['match_score'] = match_score / len(metadata_filter)
-                            filtered_results.append(row)
+                        # Calculate final score (normalized by importance factors)
+                        if total_match_factors > 0:
+                            final_match_score = match_score / total_match_factors
+                            
+                            # Add warning metadata for database-specific content that doesn't match the requested database
+                            if requested_database_type and "database_type" in row_metadata and row_metadata.get("database_specific", True):
+                                db_type = row_metadata.get("database_type")
+                                if db_type and db_type.lower() != requested_database_type.lower():
+                                    # Add a warning to metadata
+                                    row_metadata["warning"] = f"Information is specific to {db_type}, not confirmed for {requested_database_type}"
+                                    # Store updated metadata back in the row
+                                    row['metadata'] = json.dumps(row_metadata)
+                            
+                            # Consider a match if score is positive
+                            if match_score > 0:
+                                row['match_score'] = final_match_score
+                                row['match_details'] = json.dumps(matches)
+                                filtered_results.append(row)
                     except json.JSONDecodeError:
                         logger.warning(f"Invalid JSON in metadata: {row['metadata']}")
                         continue
@@ -477,10 +554,27 @@ class VectorStore:
                 if filtered_results:
                     filtered_results = sorted(filtered_results, key=lambda x: x.get('match_score', 0), reverse=True)
                     results = pd.DataFrame(filtered_results)
-                    logger.debug(f"After filtering: {len(filtered_results)} results")
+                    logger.debug(f"After filtering: {len(filtered_results)} results with enhanced metadata filtering")
                 else:
                     # No results match filter - return top semantic matches instead of nothing
                     logger.warning("No results match the metadata filter, returning top semantic matches instead")
+                    
+                    # If database-specific filter was requested but not found, add warning
+                    if requested_database_type:
+                        # Create a system message as the first result to inform that specific data wasn't found
+                        warning_added = False
+                        for i, row in original_results.iterrows():
+                            try:
+                                row_metadata = json.loads(row['metadata'])
+                                row_metadata["warning"] = f"No specific information found for {requested_database_type}. Results shown may not apply directly."
+                                original_results.at[i, 'metadata'] = json.dumps(row_metadata)
+                                warning_added = True
+                            except:
+                                pass
+                            # Only add warning to first result
+                            if warning_added:
+                                break
+                    
                     results = original_results.head(n_results)
             
             # Final limit on results
